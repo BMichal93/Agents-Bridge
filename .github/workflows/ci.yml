@@ -1,0 +1,40 @@
+name: CI
+
+# Tests spawn real processes and bind a local port, so they are worth running on
+# both platforms: the Windows path through cmd.exe and taskkill is the one most
+# likely to break, and it is the platform most users are on.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm run check
+      - run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci || npm install
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles
+          path: dist/*

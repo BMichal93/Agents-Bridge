@@ -43,6 +43,19 @@ function syncVersions() {
       log(`synced ${rel} to ${VERSION}`);
     }
   }
+  // Docs name the downloadable files, so they go stale on every release unless
+  // they are synchronised here as well.
+  for (const doc of ["README.md", "packages/vscode/README.md"]) {
+    const file = path.join(ROOT, doc);
+    if (!fs.existsSync(file)) continue;
+    const text = fs.readFileSync(file, "utf8");
+    const updated = text.replace(/agent-bridge-\d+\.\d+\.\d+\.(mcpb|vsix)/g, `agent-bridge-${VERSION}.$1`);
+    if (updated !== text) {
+      fs.writeFileSync(file, updated);
+      log(`synced ${doc} download names to ${VERSION}`);
+    }
+  }
+
   // The server reports its own version over the protocol, so it has to match too.
   const src = fs.readFileSync(SERVER, "utf8");
   const patched = src.replace(/const SERVER_VERSION = "\d+\.\d+\.\d+";/, `const SERVER_VERSION = "${VERSION}";`);

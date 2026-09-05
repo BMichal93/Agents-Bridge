@@ -95,15 +95,33 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
   boundaries: CLI sandboxes, a verification allowlist and stricter remote-mode
   behavior. It does not implement user identities or per-tool authorization.
 
-## Unverified
+## Unverified against a live CLI
 
+The suite substitutes stub executables, so it proves the bridge's behaviour and
+nothing about whether the real CLIs accept these. **`npm run doctor` checks every
+item on this list**; run it after installing and after either CLI updates.
+
+- `claude --tools`. This is the one that matters. `--allowedTools` only skips
+  permission prompts and appends to the default tool set, so if `--tools` ever
+  goes away, `ask_claude` stops being read-only while still looking like it is.
+- `codex exec resume` and the `thread.started.thread_id` field in the JSONL
+  stream. Lanes depend on both; `AGENT_BRIDGE_CODEX_RESUME=0` disables them.
+- `codex -a never` and `-c model_reasoning_effort=...`, both behind env vars that
+  can drop them.
 - `codex app-server`'s `account/rateLimits/read` is an internal method name and
-  may move. There is a fallback, and failure is silent by design.
-- `codex -a never` and `-c model_reasoning_effort=...` are taken from Codex docs
-  and issue threads, not tested against a live CLI here. Both are behind env vars
-  that can drop them.
+  may move. There is a fallback and failure is silent by design.
 - The Codex desktop app reportedly shares MCP config with the Codex CLI. Sources
   conflict. The CLI and IDE extension are certain; the desktop app is not.
+
+## Output is spent from the caller's context
+
+Everything a tool returns is re-sent on every later turn of the caller's session,
+so size is a feature, not a detail. Replies are trimmed to
+`AGENT_BRIDGE_MAX_REPLY_CHARS`, working-tree reporting is a bounded delta rather
+than two full listings, the project context is capped, and `start_codex_jobs`
+deliberately carries short field descriptions because the full guidance is
+already on `delegate_to_codex`. Tool definitions alone cost roughly 2300 tokens
+per session. Before adding prose to a description, weigh it against that.
 
 
 ## Coordination and remote access

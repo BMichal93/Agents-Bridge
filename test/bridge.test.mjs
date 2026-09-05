@@ -19,7 +19,10 @@ test("handshake and tool listing", async () => {
   const c = client(env);
   const init = await c.init();
   assert.equal(init.result.serverInfo.name, "agent-bridge");
-  assert.equal(init.result.serverInfo.version, "0.9.1");
+    // Read the expected version rather than hardcoding it: a literal here means
+  // every release breaks a test that is not about versions at all.
+  const expectedVersion = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  assert.equal(init.result.serverInfo.version, expectedVersion);
   // We echo the client's protocol version rather than insisting on our own.
   assert.equal(init.result.protocolVersion, "2025-06-18");
   assert.equal(init.result.capabilities.tools.listChanged, true);
@@ -360,17 +363,27 @@ test("missing verify is called out rather than passing silently", async () => {
   c.close();
 });
 
-test("the working-tree report includes untracked files", async () => {
+test("the working-tree report includes untracked files created by the delegation", async () => {
   const { env, home } = setup({ stdout: "done" });
   const repo = path.join(home, "repo-with-untracked");
   fs.mkdirSync(repo, { recursive: true });
   spawnSync("git", ["init", "--quiet"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "new-file.ts"), "export const value = 1;\n");
+  // Dirty beforehand, so this also proves pre-existing entries are summarised
+  // rather than listed again.
+  fs.writeFileSync(path.join(repo, "was-here-already.ts"), "old\n");
+
+  const js = path.join(home, "bin", "codex.stub.mjs");
+  fs.writeFileSync(
+    js,
+    `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(path.join(repo, "new-file.ts"))}, "export const value = 1;\\n");\nconsole.log("wrote a file");\n`
+  );
+
   const c = client(env);
   await c.init();
-  const text = c.text(await c.call("delegate_to_codex", { task: "inspect", cwd: repo }));
+  const text = c.text(await c.call("delegate_to_codex", { task: "build", cwd: repo }));
   assert.match(text, /\?\? new-file\.ts/);
-  assert.match(text, /already present before delegation/);
+  assert.match(text, /1 entry was already present/);
+  assert.ok(!text.includes("was-here-already.ts"), "pre-existing entries should be counted, not listed");
   c.close();
 });
 
@@ -548,5 +561,62 @@ test("a quoted path containing a space is kept as one claim", async () => {
   // Different files, so both should run rather than one waiting on the other.
   assert.match(started, /2 running/);
   await c.call("collect_codex_jobs", {});
+  c.close();
+});
+
+test("git summary reports the delta, not two full listings", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "gitrepo");
+  fs.mkdirSync(repo, { recursive: true });
+  const { spawnSync } = await import("node:child_process");
+  const run = (...a) => spawnSync("git", a, { cwd: repo, encoding: "utf8" });
+  run("init", "-q");
+  run("config", "user.email", "t@t");
+  run("config", "user.name", "t");
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "one\n");
+  run("add", "-A");
+  run("commit", "-qm", "init");
+  // Dirty the tree before the delegation, the way a real session usually is.
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "two\n");
+  for (let i = 0; i < 5; i++) fs.writeFileSync(path.join(repo, `pre-${i}.txt`), "x");
+
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t", cwd: repo }));
+
+  // Nothing new was written by the stub, so the pre-existing mess must be
+  // summarised as a count rather than listed again.
+  assert.match(text, /no new working-tree entries/);
+  assert.match(text, /6 entries were already present/);
+  assert.ok(!text.includes("pre-4.txt"), "pre-existing files should not be listed");
+  c.close();
+});
+
+test("a large number of new entries is capped", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "bigrepo");
+  fs.mkdirSync(repo, { recursive: true });
+  const { spawnSync } = await import("node:child_process");
+  const run = (...a) => spawnSync("git", a, { cwd: repo, encoding: "utf8" });
+  run("init", "-q");
+  run("config", "user.email", "t@t");
+  run("config", "user.name", "t");
+  fs.writeFileSync(path.join(repo, "seed.txt"), "x");
+  run("add", "-A");
+  run("commit", "-qm", "init");
+
+  // The stub creates a pile of untracked files, standing in for a build output
+  // directory that nobody gitignored.
+  const js = path.join(home, "bin", "codex.stub.mjs");
+  fs.writeFileSync(
+    js,
+    `import fs from "node:fs";\nfor (let i = 0; i < 120; i++) fs.writeFileSync(${JSON.stringify(repo)} + "/gen-" + i + ".txt", "x");\nconsole.log("made files");\n`
+  );
+
+  const c = client({ ...env, AGENT_BRIDGE_MAX_STATUS_LINES: "10" });
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t", cwd: repo }));
+  assert.match(text, /changed by this delegation \(12\d\)/);
+  assert.match(text, /and 1\d\d more/);
   c.close();
 });

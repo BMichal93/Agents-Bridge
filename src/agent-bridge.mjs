@@ -32,7 +32,7 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.2";
+const SERVER_VERSION = "0.9.3";
 
 // Questions come back in a minute or two. Real work takes longer, so the two
 // paths get separate budgets rather than one compromise value.
@@ -392,12 +392,39 @@ function gitSnapshot(cwd) {
   });
 }
 
+// Everything this returns is spent from the caller's context window on every
+// delegation, so it reports the delta rather than two full listings. A repo that
+// was already dirty with thirty files used to reprint all thirty twice per call,
+// which is a lot of tokens to say "nothing new here".
+const MAX_STATUS_LINES = Number(process.env.AGENT_BRIDGE_MAX_STATUS_LINES) || 40;
+
 function formatGitSummary(before, after) {
   if (after === null) return "(no git status available: not a git repository, or git is not on PATH)";
   if (!after) return "working tree after delegation: clean";
-  const parts = [`working tree after delegation:\n${after}`];
-  if (before) parts.push(`already present before delegation:\n${before}`);
-  return parts.join("\n\n");
+
+  const afterLines = after.split("\n").filter(Boolean);
+  const beforeLines = before ? before.split("\n").filter(Boolean) : [];
+  const beforeSet = new Set(beforeLines);
+  const fresh = afterLines.filter((line) => !beforeSet.has(line));
+  const carried = afterLines.length - fresh.length;
+
+  // A file already modified before the run shows the same status line after it,
+  // so a further edit to it is invisible here. Say so rather than implying the
+  // delta is the whole truth.
+  const caveat = carried
+    ? `\n${carried} entr${carried === 1 ? "y was" : "ies were"} already present before this delegation; ` +
+      "further edits to those cannot be distinguished from git status alone."
+    : "";
+
+  if (!fresh.length) return `no new working-tree entries from this delegation.${caveat}`;
+
+  const shown = fresh.slice(0, MAX_STATUS_LINES);
+  const hidden = fresh.length - shown.length;
+  return (
+    `changed by this delegation (${fresh.length}):\n${shown.join("\n")}` +
+    (hidden ? `\n... and ${hidden} more (raise AGENT_BRIDGE_MAX_STATUS_LINES to see them)` : "") +
+    caveat
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -515,9 +542,14 @@ async function delegateToCodex({ task, files, constraints, acceptance, verify: v
 }
 
 async function askClaude({ question, cwd, model, effort }) {
-  // Restricting the tool list is what makes this read-only, and it matters more
-  // than it looks: in print mode there is no human to answer a permission
-  // prompt, so a tool outside the list is denied rather than hanging.
+  // --tools, not --allowedTools. They look interchangeable and are not:
+  // --allowedTools only skips the permission prompt for the tools it names, and
+  // it appends to Claude Code's default tool set rather than replacing it, so a
+  // run started that way still has Edit, Write and Bash available. --tools is
+  // the flag that decides which built-in tools exist at all. This is the whole
+  // read-only guarantee of ask_claude, and `npm run doctor` checks the flag is
+  // still there, because losing it would silently remove the guarantee while
+  // everything kept working.
   const chosen = resolveEffort("claude", effort);
   const args = [
     "-p",
@@ -1082,44 +1114,27 @@ const TOOLS = [
       properties: {
         tasks: {
           type: "array",
-          description: "The pieces to build. Each is a complete handoff on its own.",
+          // Short descriptions here on purpose. The full field guidance is on
+          // delegate_to_codex, and repeating all of it costs several hundred
+          // tokens in every session for a reader who has already seen it.
+          description:
+            "The pieces to build. Each entry takes the same fields as delegate_to_codex and must be a complete handoff " +
+            "on its own. Declare `files` accurately: it is what decides which jobs may run at the same time.",
           items: {
             type: "object",
             properties: {
-        task: {
-          type: "string",
-          description:
-            "What to build, written for someone who has never seen your conversation. State the goal and the approach " +
-            "you have decided on, not just the outcome. This is the design handoff: the more precisely you specify it, " +
-            "the less of the result you have to read.",
-        },
-        files: {
-          type: "string",
-          description:
-            "Files or directories to work in, and any that are relevant but read-only. Separate them with commas, " +
-            "newlines or spaces; quote a path that contains a space. This list is also what decides whether two " +
-            "background jobs may run at the same time, so declaring it accurately matters.",
-        },
-        constraints: {
-          type: "string",
-          description: "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",
-        },
-        acceptance: { type: "string", description: "How to tell it is done, in words." },
-        verify: {
-          type: "string",
-          description:
-            "A command that proves the work: `npm test`, `dotnet build`, `pytest tests/auth`. The bridge runs it after " +
-            "Codex finishes and reports pass or fail. Give one whenever the repository has one. This is what lets you " +
-            "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
-        },
+              task: { type: "string", description: "What to build, as in delegate_to_codex." },
+              files: {
+                type: "string",
+                description:
+                  "Files or directories this job touches, separated by commas, newlines or spaces. Two jobs whose " +
+                  "paths overlap are run one after the other. Omitting this claims the whole workspace.",
+              },
+              constraints: { type: "string", description: "What not to do." },
+              acceptance: { type: "string", description: "How to tell it is done, in words." },
+              verify: { type: "string", description: "Command proving the work, run after Codex finishes." },
               cwd: CWD_PROP,
-        lane: {
-          type: "string",
-          description:
-            "Name a thread of related builds, like 'auth-refactor'. The first task in a lane starts a Codex session and " +
-            "later ones resume it, so Codex still knows the files it read and the decisions it made. Use the same lane " +
-            "for a sequence of related work; use different lanes for unrelated work.",
-        },
+              lane: { type: "string", description: "Thread of related builds, as in delegate_to_codex." },
               effort: EFFORT_PROP,
             },
             required: ["task"],

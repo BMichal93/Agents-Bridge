@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.3
+
+- Working-tree reporting is now a bounded delta. It previously printed the full
+  `git status` twice, so a repository that was already dirty spent hundreds of
+  tokens per delegation restating what had not changed. Pre-existing entries are
+  counted, new ones listed up to `AGENT_BRIDGE_MAX_STATUS_LINES`, and the
+  attribution limit is stated rather than implied.
+- `npm run doctor` checks the installed Codex and Claude CLIs still accept every
+  flag the bridge relies on, including `claude --tools`, and makes one live
+  read-only Codex call.
+- `start_codex_jobs` no longer repeats the full field guidance already carried by
+  `delegate_to_codex`, cutting roughly 200 tokens from every session.
+- Settings reference added to the README; the build now syncs download filenames
+  in the docs, and the version test reads package.json instead of a literal.
+
 ## 0.9.2
 
 - Fix: background-job file claims were split only on commas and newlines, so a

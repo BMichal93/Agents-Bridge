@@ -32,7 +32,7 @@ across related tasks.
 
 ### Claude Desktop
 
-1. Download `agent-bridge-0.9.1.mcpb` from Releases.
+1. Download `agent-bridge-0.9.3.mcpb` from Releases.
 2. Double-click it, or drag it into **Settings > Extensions**.
 3. Set **Default project folder** if requests will not always include an
    absolute `cwd`.
@@ -44,7 +44,7 @@ the local Codex CLI.
 ### VS Code, Claude Code and Codex CLI
 
 1. In VS Code, open **Extensions > ... > Install from VSIX**.
-2. Select `agent-bridge-0.9.1.vsix`.
+2. Select `agent-bridge-0.9.3.vsix`.
 3. Accept the one-time offer to enable the bridge for the Codex and Claude Code
    CLIs. You can run **Agent Bridge: Enable for Codex and Claude Code** later if
    you initially decline.
@@ -95,7 +95,7 @@ session ID from Codex's documented JSONL stream and scopes it to the absolute
 repository path, so an identical lane name in another repository stays separate.
 
 Use `start_codex_jobs` for multiple tasks. List exact files or directories,
-separated by commas or new lines. Tasks whose paths overlap are queued across
+separated by commas, new lines or spaces; quote a path that contains a space. Tasks whose paths overlap are queued across
 separate calls; independent tasks run concurrently. Omitting `files`, or using a
 glob, safely treats the task as touching the entire workspace.
 
@@ -166,12 +166,56 @@ tunnel behind its own authentication.
 - Background work exists only for the lifetime of the MCP server. Closing its
   host cancels queued and running jobs.
 
+## Settings reference
+
+Most people never need these. The extension and the MCPB install screen set the
+first four for you.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENT_BRIDGE_DEFAULT_CWD` | unset | Folder used when a request does not name one |
+| `AGENT_BRIDGE_CONSERVE` | unset | `1` turns on conserve mode |
+| `AGENT_BRIDGE_CODEX_BIN` | `codex` | Full path if it is not on PATH |
+| `AGENT_BRIDGE_CLAUDE_BIN` | `claude` | Full path if it is not on PATH |
+| `AGENT_BRIDGE_TIMEOUT_MS` | `300000` | Timeout for `ask_` tools |
+| `AGENT_BRIDGE_DELEGATE_TIMEOUT_MS` | `1800000` | Timeout for delegations and jobs |
+| `AGENT_BRIDGE_MAX_REPLY_CHARS` | `6000` | Trim a long peer reply before it reaches the caller |
+| `AGENT_BRIDGE_MAX_STATUS_LINES` | `40` | Cap on working-tree entries listed per delegation |
+| `AGENT_BRIDGE_MAX_FAILURES` | `2` | Failures of one peer before the breaker opens |
+| `AGENT_BRIDGE_CONTEXT_MAX` | `8000` | Cap on the injected project context |
+| `AGENT_BRIDGE_VERIFY_ALLOW` | test runners | Commands `verify` may run, matched on the first token |
+| `AGENT_BRIDGE_CODEX_MODEL` | unset | Blanket Codex model for bridged calls |
+| `AGENT_BRIDGE_CLAUDE_MODEL` | unset | Blanket Claude model for bridged calls |
+| `AGENT_BRIDGE_CODEX_APPROVAL` | `never` | Codex approval policy; empty omits the flag |
+| `AGENT_BRIDGE_CODEX_STDIN` | unset | `0` passes the prompt as an argument instead of stdin |
+| `AGENT_BRIDGE_CODEX_RESUME` | unset | `0` disables lanes if your Codex has no `exec resume` |
+| `AGENT_BRIDGE_REMOTE_SECRET` | unset | Required for `--http`; 24 characters or more |
+| `AGENT_BRIDGE_HTTP_PORT` | `7333` | Port for HTTP mode |
+| `AGENT_BRIDGE_HTTP_HOST` | `127.0.0.1` | Interface for HTTP mode; leave it on loopback |
+| `AGENT_BRIDGE_REMOTE_WRITES` | unset | `1` gives remote callers local write capability |
+
+## Checking your setup
+
+```text
+npm run doctor
+```
+
+The test suite uses stub CLIs, so it cannot tell whether the real Codex and
+Claude Code accept the flags the bridge passes. `doctor` checks each one against
+the installed CLIs and makes one live read-only Codex call. Run it after
+installing and after either CLI updates. `--no-live` skips the live call.
+
+The check that matters most is `claude --tools`. `--allowedTools` only skips
+permission prompts and appends to the default tool set, so if `--tools` ever
+disappears, `ask_claude` stops being read-only while still looking like it is.
+
 ## Development
 
 ```text
 npm run check    syntax-check both JavaScript entry points
 npm test         run protocol and process integration tests with stub CLIs
 npm run build    produce the MCPB and VSIX in dist/
+npm run doctor   check the installed CLIs accept the flags the bridge uses
 ```
 
 `src/agent-bridge.mjs` is the server source. The build copies it into both

@@ -121,7 +121,9 @@ so size is a feature, not a detail. Replies are trimmed to
 than two full listings, the project context is capped, and `start_codex_jobs`
 deliberately carries short field descriptions because the full guidance is
 already on `delegate_to_codex`. Tool definitions alone cost roughly 2300 tokens
-per session. Before adding prose to a description, weigh it against that.
+per session, and a test fails if they pass 11000 bytes. Before adding prose to a
+description, weigh it against that, and run `npm run budget` to see the effect on
+a whole session.
 
 
 ## Coordination and remote access

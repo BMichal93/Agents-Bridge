@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
   "description": "Delegate coding work to OpenAI Codex from Claude and Copilot, and ask it for second opinions.",
@@ -9,7 +9,8 @@
     "check": "node --check src/agent-bridge.mjs && node --check packages/vscode/extension.js",
     "test": "node --test test/*.test.mjs",
     "build": "node scripts/build.mjs",
-    "doctor": "node scripts/doctor.mjs"
+    "doctor": "node scripts/doctor.mjs",
+    "budget": "node scripts/budget.mjs"
   },
   "devDependencies": {
     "@vscode/vsce": "^3.9.0"

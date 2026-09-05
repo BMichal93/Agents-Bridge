@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.4
+
+- `npm run budget` measures what the pack costs and saves, counting design
+  reading, handoff writing, results and tool definitions against the delegated
+  side. Reports a loss on small tasks rather than hiding it.
+- Full-session integration test asserting each step stays small, plus a ceiling
+  test on the size of the tool definitions, which are re-sent every turn.
+
 ## 0.9.3
 
 - Working-tree reporting is now a bounded delta. It previously printed the full

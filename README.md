@@ -32,7 +32,7 @@ across related tasks.
 
 ### Claude Desktop
 
-1. Download `agent-bridge-0.9.3.mcpb` from Releases.
+1. Download `agent-bridge-0.9.4.mcpb` from Releases.
 2. Double-click it, or drag it into **Settings > Extensions**.
 3. Set **Default project folder** if requests will not always include an
    absolute `cwd`.
@@ -44,7 +44,7 @@ the local Codex CLI.
 ### VS Code, Claude Code and Codex CLI
 
 1. In VS Code, open **Extensions > ... > Install from VSIX**.
-2. Select `agent-bridge-0.9.3.vsix`.
+2. Select `agent-bridge-0.9.4.vsix`.
 3. Accept the one-time offer to enable the bridge for the Codex and Claude Code
    CLIs. You can run **Agent Bridge: Enable for Codex and Claude Code** later if
    you initially decline.
@@ -193,6 +193,38 @@ first four for you.
 | `AGENT_BRIDGE_HTTP_PORT` | `7333` | Port for HTTP mode |
 | `AGENT_BRIDGE_HTTP_HOST` | `127.0.0.1` | Interface for HTTP mode; leave it on loopback |
 | `AGENT_BRIDGE_REMOTE_WRITES` | unset | `1` gives remote callers local write capability |
+
+## Does it actually save anything
+
+```text
+npm run budget
+```
+
+Runs a realistic session against stub CLIs and reports the bytes that come back,
+then compares that with doing the same work inline. Both sides are counted: the
+delegated side pays for the files Claude still reads to design the handoff, the
+handoff itself, the results, and the tool definitions that sit in every session.
+
+On the default assumptions - six files read per task, 180 lines each, 120 lines
+written - delegating five tasks consumes roughly 2.9x less of Claude's context
+than doing them inline. This matters more than a single multiplier suggests,
+because a coding agent re-sends the whole transcript every turn, so context spent
+early is paid again on every later turn. That is the mechanism by which a session
+lasts longer.
+
+Adjust it to your repository:
+
+```text
+npm run budget -- --files 12 --lines 300 --written 400
+```
+
+Small tasks lose, and the tool says so rather than hiding it. Try
+`--files 1 --lines 40 --written 15` and it reports that delegating costs more
+than doing the work inline. The break-even is roughly one substantial delegation
+per session; below that, the tool definitions cost more than they save.
+
+What it does not measure: Codex's own quota, which is spent either way. This is
+about Claude's context, not total spend across both providers.
 
 ## Checking your setup
 

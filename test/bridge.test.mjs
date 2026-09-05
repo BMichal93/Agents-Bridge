@@ -620,3 +620,61 @@ test("a large number of new entries is capped", async () => {
   assert.match(text, /and 1\d\d more/);
   c.close();
 });
+
+test("a full session runs end to end and stays small", async () => {
+  // Smoothness check: the sequence the README recommends, in order, with the
+  // sizes asserted. If any single step starts returning kilobytes, the pack has
+  // stopped doing the one thing it exists to do.
+  const { env, home } = setup({ stdout: "Implemented the change." });
+  const repo = path.join(home, "session-repo");
+  fs.mkdirSync(repo, { recursive: true });
+  spawnSync("git", ["init", "--quiet"], { cwd: repo });
+
+  const c = client(env);
+  const init = await c.init();
+  assert.equal(init.result.serverInfo.name, "agent-bridge");
+
+  const steps = [];
+  const step = async (label, name, args) => {
+    const text = c.text(await c.call(name, args));
+    steps.push({ label, size: text.length });
+    return text;
+  };
+
+  await step("context", "set_project_context", { content: "Hexagonal. Thin handlers.", cwd: repo });
+  const first = await step("delegate", "delegate_to_codex", { task: "Add validation", cwd: repo, lane: "session" });
+  // Verdict shape: what changed comes before the builder's narration.
+  assert.ok(first.indexOf("codex said:") > 0, "codex narration should come last");
+
+  await step("follow-up", "delegate_to_codex", { task: "Extend it", cwd: repo, lane: "session" });
+  const started = await step("start jobs", "start_codex_jobs", {
+    tasks: [
+      { task: "a", files: "a.cs", cwd: repo },
+      { task: "b", files: "b.cs", cwd: repo },
+    ],
+  });
+  assert.match(started, /2 running/);
+  const collected = await step("collect", "collect_codex_jobs", {});
+  assert.match(collected, /job-1/);
+  assert.match(collected, /job-2/);
+
+  // No single step should be large. The whole point is that results are small.
+  for (const s of steps) {
+    assert.ok(s.size < 4000, `${s.label} returned ${s.size} bytes, which is too much for one step`);
+  }
+  const total = steps.reduce((sum, s) => sum + s.size, 0);
+  assert.ok(total < 8000, `whole session returned ${total} bytes`);
+  c.close();
+});
+
+test("tool definitions stay within their context budget", async () => {
+  // These are re-sent on every turn of every session, so growth here is paid
+  // repeatedly. Treat this ceiling as a design constraint, not a lint.
+  const { env } = setup();
+  const c = client(env);
+  await c.init();
+  const list = await c.send("tools/list", {});
+  const size = JSON.stringify(list.result.tools).length;
+  assert.ok(size < 11000, `tool definitions are ${size} bytes; trim a description before raising this`);
+  c.close();
+});

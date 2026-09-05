@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Shared project context: `.agent-bridge/context.md` in the repository is
+  prepended to every delegation, so task descriptions stop re-explaining the
+  architecture. `set_project_context` writes it.
+- Conversation lanes: name a thread of related builds and Codex resumes the same
+  session, keeping what it already read and decided. Skipped on resumed sessions
+  so the context is not paid for twice.
+
 ## 0.8.0
 
 - Reframed around an architect/builder split: Claude designs, Codex implements.

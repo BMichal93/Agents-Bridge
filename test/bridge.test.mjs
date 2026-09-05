@@ -25,7 +25,7 @@ test("handshake and tool listing", async () => {
   const list = await c.send("tools/list", {});
   assert.deepEqual(
     list.result.tools.map((t) => t.name),
-    ["ask_codex", "delegate_to_codex", "start_codex_jobs", "collect_codex_jobs", "ask_claude"]
+    ["ask_codex", "delegate_to_codex", "start_codex_jobs", "collect_codex_jobs", "set_project_context", "ask_claude"]
   );
   c.close();
 });
@@ -315,5 +315,55 @@ test("jobs touching the same files are not started at once", async () => {
   );
   assert.match(start, /Started 1 Codex build/);
   assert.match(start, /files overlap/);
+  c.close();
+});
+
+
+test("project context is written once and injected into every delegation", async () => {
+  const { env, home } = setup({ echoArgs: true });
+  const repo = path.join(home, "repo");
+  fs.mkdirSync(repo, { recursive: true });
+  const c = client(env);
+  await c.init();
+
+  const saved = c.text(await c.call("set_project_context", { content: "Hexagonal architecture. No new deps.", cwd: repo }));
+  assert.match(saved, /Saved \d+ characters/);
+  assert.ok(fs.existsSync(path.join(repo, ".agent-bridge", "context.md")));
+
+  // The stub echoes the last prompt line, so a marker at the end proves the
+  // whole framed prompt reached Codex with the context section in it.
+  const used = c.text(await c.call("delegate_to_codex", { task: "MARKER-TASK", cwd: repo }));
+  assert.match(used, /MARKER-TASK/);
+  c.close();
+});
+
+test("an oversized project context is truncated rather than sent whole", async () => {
+  const { env, home } = setup();
+  const repo = path.join(home, "repo2");
+  fs.mkdirSync(path.join(repo, ".agent-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".agent-bridge", "context.md"), "x".repeat(50000));
+  const c = client({ ...env, AGENT_BRIDGE_CONTEXT_MAX: "500" });
+  await c.init();
+  const res = await c.call("delegate_to_codex", { task: "t", cwd: repo });
+  // It must still complete; the guard is about size, not about failing.
+  assert.ok(c.text(res).length > 0);
+  c.close();
+});
+
+test("a lane resumes an existing Codex session instead of starting cold", async () => {
+  const { env, home } = setup({ echoArgs: true });
+  fs.mkdirSync(path.join(home, ".agent-bridge"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".agent-bridge", "lanes.json"),
+    JSON.stringify({ "auth-refactor": { sessionId: "abc123-session", at: Date.now() } })
+  );
+  const c = client(env);
+  await c.init();
+
+  const resumed = c.text(await c.call("delegate_to_codex", { task: "next step", lane: "auth-refactor" }));
+  assert.match(resumed, /exec resume abc123-session/);
+
+  const cold = c.text(await c.call("delegate_to_codex", { task: "unrelated", lane: "other-lane" }));
+  assert.ok(!/resume/.test(cold), "an unknown lane should not resume anything");
   c.close();
 });

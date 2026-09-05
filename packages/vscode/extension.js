@@ -100,6 +100,18 @@ verdict instead of a diff. So every handoff carries:
 A handoff you cannot write down is a design you have not finished. Finish it
 first; that part is your job anyway.
 
+## Ground it once, not every time
+
+At the start of work on a repository, call \`set_project_context\` with the
+architecture, conventions, key interfaces and what not to touch. It is saved to
+\`.agent-bridge/context.md\` and prepended to every later handoff automatically, so
+task descriptions stay short instead of repeating the project each time. That
+repetition is otherwise where the saving goes.
+
+Give related builds the same \`lane\` name. The first starts a Codex session and
+later ones resume it, so Codex still knows the files it read and the decisions it
+made. Different work gets a different lane.
+
 ## Work in parallel
 
 Use \`start_codex_jobs\` when there is more than one independent piece, or when you

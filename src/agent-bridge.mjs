@@ -308,10 +308,13 @@ const askFrame = (question) =>
 // A delegated task is a handoff to a process with no memory of your conversation.
 // The sections exist to force the caller to write down what it would otherwise
 // assume: which files, what not to touch, and how anyone can tell it worked.
-const delegateFrame = ({ task, files, constraints, acceptance, verify: verifyCommand }) =>
+const delegateFrame = ({ task, files, constraints, acceptance, verify: verifyCommand, cwd, resuming }) =>
   [
     "You are an implementation agent working on a task delegated by another AI agent.",
     "You have no access to the conversation this task came from, so everything you need is below.",
+    // On a resumed session Codex already has the project context from the first
+    // message in the thread. Repeating it would be paying for it again.
+    !resuming && readProjectContext(cwd) ? `\n## Project context\n${readProjectContext(cwd)}` : "",
     "Do the work, then reply with a short summary: what you changed, which files, and anything",
     "you could not finish or had to guess. Do not start work beyond what is described.",
     `\n## Task\n${task}`,
@@ -337,7 +340,7 @@ const CODEX_STDIN = process.env.AGENT_BRIDGE_CODEX_STDIN !== "0";
 const CODEX_APPROVAL = process.env.AGENT_BRIDGE_CODEX_APPROVAL ?? "never";
 const approvalArgs = () => (CODEX_APPROVAL ? ["-a", CODEX_APPROVAL] : []);
 
-function codexArgs({ write, prompt, model, effort }) {
+function codexArgs({ write, prompt, model, effort, resumeId }) {
   const chosen = resolveEffort("codex", effort);
   // -c applies a one-off config override for this run only, so a deep task can
   // think harder without changing the setting for your interactive sessions.
@@ -347,6 +350,9 @@ function codexArgs({ write, prompt, model, effort }) {
     ...approvalArgs(),
     ...reasoning,
     "exec",
+    // `resume <id>` continues an existing Codex thread. It has to come straight
+    // after exec, before the stdin marker.
+    ...(resumeId ? ["resume", resumeId] : []),
     ...(CODEX_STDIN ? ["-"] : []),
     "--sandbox",
     write ? "workspace-write" : "read-only",
@@ -363,13 +369,24 @@ async function askCodex({ question, cwd, model, effort }) {
   return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS);
 }
 
-async function delegateToCodex({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes }) {
+async function delegateToCodex({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes, lane }) {
   // Over HTTP the default is read-only. A remote caller that can write files on
   // your machine is a different kind of thing from a local one, so it has to be
   // turned on deliberately rather than inherited from the local behaviour.
   const write = REMOTE_MODE ? REMOTE_WRITES && allow_writes !== false : true;
-  const prompt = delegateFrame({ task, files, constraints, acceptance });
-  const r = await runAgent(CODEX_BIN, codexArgs({ write, prompt, model, effort }), prompt, cwd, DELEGATE_TIMEOUT_MS);
+
+  const resumeId = lane && RESUME_ENABLED ? loadLanes()[lane]?.sessionId : null;
+  const prompt = delegateFrame({ task, files, constraints, acceptance, verify: verifyCommand, cwd, resuming: Boolean(resumeId) });
+
+  // Snapshot before the run so we can tell which session was created by it. The
+  // set difference is reliable even with several builds running at once, where
+  // "newest file" would not be.
+  const before = lane && RESUME_ENABLED && !resumeId ? rolloutIds() : null;
+  const r = await runAgent(CODEX_BIN, codexArgs({ write, prompt, model, effort, resumeId }), prompt, cwd, DELEGATE_TIMEOUT_MS);
+  if (before) {
+    const fresh = [...rolloutIds()].filter((id) => !before.has(id));
+    if (fresh.length === 1) saveLane(lane, fresh[0]);
+  }
   // Ask git what changed even when the run failed: a delegation that died partway
   // through still leaves edits behind, and that is exactly when you want to know.
   const diff = await gitSummary(cwd);
@@ -392,6 +409,93 @@ async function askClaude({ question, cwd, model, effort }) {
   const chosen = resolveEffort("claude", effort);
   const args = ["-p", "--allowedTools", "Read,Grep,Glob", ...modelArgs("--model", model, chosen.model || CLAUDE_MODEL)];
   return runAgent(CLAUDE_BIN, args, askFrame(question), cwd, ASK_TIMEOUT_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Shared project context
+//
+// Every Codex run starts cold. Without this, the calling model re-explains the
+// architecture, the conventions and the interfaces in every single handoff,
+// which is exactly the repetition that delegating was supposed to avoid: real
+// Claude tokens spent saying the same thing again.
+//
+// So the grounding lives in a file in the repository and gets prepended to every
+// delegation. Written once, used by every build after it. It is a repo file on
+// purpose: it belongs to the project, survives sessions, and you can read and
+// edit it yourself.
+// ---------------------------------------------------------------------------
+
+const CONTEXT_MAX = Number(process.env.AGENT_BRIDGE_CONTEXT_MAX) || 8000;
+
+const contextPath = (cwd) => path.join(cwd || DEFAULT_CWD || process.cwd(), ".agent-bridge", "context.md");
+
+function readProjectContext(cwd) {
+  for (const file of [contextPath(cwd), path.join(STATE_DIR, "context.md")]) {
+    try {
+      const text = fs.readFileSync(file, "utf8").trim();
+      // A context file that grows without limit turns into the bloat it exists
+      // to prevent, except now it is on every delegation instead of just one.
+      if (text) return text.length > CONTEXT_MAX ? text.slice(0, CONTEXT_MAX) + "\n[...truncated by agent-bridge]" : text;
+    } catch {}
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Codex conversation lanes
+//
+// A lane is a named thread of related builds. The first delegation in a lane
+// starts a Codex session; later ones resume it, so Codex remembers the files it
+// already read and the decisions it already made. That is the difference between
+// five independent cold starts and one build conversation.
+//
+// The session id is captured by watching which rollout file appears, rather than
+// by parsing Codex's event stream, because the stream format is version-specific
+// and the file naming has been stable. Set AGENT_BRIDGE_CODEX_RESUME=0 if your
+// Codex build does not support `exec resume`.
+// ---------------------------------------------------------------------------
+
+const RESUME_ENABLED = process.env.AGENT_BRIDGE_CODEX_RESUME !== "0";
+const LANES_FILE = path.join(STATE_DIR, "lanes.json");
+
+function loadLanes() {
+  try {
+    return JSON.parse(fs.readFileSync(LANES_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveLane(lane, sessionId) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const lanes = loadLanes();
+    lanes[lane] = { sessionId, at: Date.now() };
+    fs.writeFileSync(LANES_FILE, JSON.stringify(lanes, null, 2));
+  } catch {}
+}
+
+/** Every rollout file that exists right now, by session id. */
+function rolloutIds() {
+  const ids = new Set();
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) walk(path.join(dir, e.name), depth + 1);
+      else {
+        const m = e.name.match(/^rollout-.*?-([0-9a-fA-F-]{8,})\.jsonl$/);
+        if (m) ids.add(m[1]);
+      }
+    }
+  };
+  walk(path.join(os.homedir(), ".codex", "sessions"), 0);
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +657,7 @@ function usageFromAppServer() {
       }
     });
     child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.8.0" } } }) +
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.9.0" } } }) +
         "\n" +
         JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) +
         "\n"
@@ -741,6 +845,13 @@ const TOOLS = [
             "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
         },
         cwd: CWD_PROP,
+        lane: {
+          type: "string",
+          description:
+            "Name a thread of related builds, like 'auth-refactor'. The first task in a lane starts a Codex session and " +
+            "later ones resume it, so Codex still knows the files it read and the decisions it made. Use the same lane " +
+            "for a sequence of related work; use different lanes for unrelated work.",
+        },
         effort: EFFORT_PROP,
         model: MODEL_PROP,
       },
@@ -788,6 +899,13 @@ const TOOLS = [
             "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
         },
               cwd: CWD_PROP,
+        lane: {
+          type: "string",
+          description:
+            "Name a thread of related builds, like 'auth-refactor'. The first task in a lane starts a Codex session and " +
+            "later ones resume it, so Codex still knows the files it read and the decisions it made. Use the same lane " +
+            "for a sequence of related work; use different lanes for unrelated work.",
+        },
               effort: EFFORT_PROP,
             },
             required: ["task"],
@@ -850,6 +968,45 @@ const TOOLS = [
       return {
         ok: settled.every((j) => j.status === "done"),
         text: settled.map((j) => `### ${j.id} (${j.status}, ${j.seconds}s) - ${j.task}\n${j.text}`).join("\n\n"),
+      };
+    },
+  },
+  {
+    name: "set_project_context",
+    peer: "Codex",
+    local: true,
+    description:
+      "Write the shared grounding that every later delegation gets automatically: architecture, conventions, key " +
+      "interfaces, what not to touch. Do this once when you start working on a repository, before the first handoff. " +
+      "It is the thing that stops you re-explaining the project in every task description, which is the repetition that " +
+      "otherwise eats the saving. Keep it to what a competent stranger would need and no more; it is sent with every " +
+      "build. Call it again to replace the file when the design moves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: {
+          type: "string",
+          description: "Markdown. Architecture, conventions, interfaces, constraints. A page, not a manual.",
+        },
+        cwd: CWD_PROP,
+      },
+      required: ["content"],
+    },
+    run: async ({ content, cwd }) => {
+      const file = contextPath(cwd);
+      try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, content.trim() + "\n");
+      } catch (e) {
+        return { ok: false, text: `Could not write ${file}: ${e.message}` };
+      }
+      const size = content.trim().length;
+      return {
+        ok: true,
+        text:
+          `Saved ${size} characters to ${file}. Every delegation from now on carries it, so task descriptions can be short.` +
+          (size > CONTEXT_MAX ? ` It exceeds the ${CONTEXT_MAX} character limit and will be truncated; trim it.` : "") +
+          " It is a repo file, so commit it if you want it shared.",
       };
     },
   },

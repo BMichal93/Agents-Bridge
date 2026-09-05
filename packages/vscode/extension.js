@@ -55,6 +55,25 @@ function serverPath(context) {
   }
 }
 
+/** Persist extension settings for bridge processes launched later by either CLI. */
+function syncSettings() {
+  const cfg = vscode.workspace.getConfiguration("agentBridge");
+  const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
+  const settings = {
+    defaultProject: cfg.get("defaultProject") || workspace,
+    conserveMode: Boolean(cfg.get("conserveMode")),
+    codexPath: cfg.get("codexPath") || "codex",
+    claudePath: cfg.get("claudePath") || "claude",
+  };
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const file = path.join(STATE_DIR, "settings.json");
+    const temporary = `${file}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(settings, null, 2));
+    fs.renameSync(temporary, file);
+  } catch {}
+}
+
 /**
  * The delegation policy, installed as a Claude Code skill.
  *
@@ -160,6 +179,9 @@ function env() {
 /** Run a CLI. Windows needs cmd.exe because both CLIs install as .cmd shims. */
 function run(bin, args) {
   const isWindows = process.platform === "win32";
+  if (isWindows && [bin, ...args].some((value) => /[&|<>^%!()"\r\n]/.test(value))) {
+    return { ok: false, out: "refused command containing Windows shell metacharacters" };
+  }
   const file = isWindows ? process.env.ComSpec || "cmd.exe" : bin;
   const argv = isWindows ? ["/d", "/s", "/c", bin, ...args] : args;
   const r = cp.spawnSync(file, argv, { encoding: "utf8", timeout: 60000 });
@@ -181,6 +203,11 @@ function applyToClis(context, enable) {
 
   for (const host of hosts) {
     if (!cliInstalled(host.bin)) {
+      if (!enable && host.label === "Claude Code") {
+        try {
+          fs.rmSync(path.dirname(skillPath()), { recursive: true, force: true });
+        } catch {}
+      }
       skipped.push(host.label);
       continue;
     }
@@ -192,7 +219,7 @@ function applyToClis(context, enable) {
     // Claude Code gets the delegation policy too. Without it the tools are
     // present but nothing tells Claude when to reach for them, which in practice
     // means it rarely does.
-    if (host.label === "Claude Code") {
+    if (host.label === "Claude Code" && (!enable || r.ok)) {
       try {
         if (enable) {
           fs.mkdirSync(path.dirname(skillPath()), { recursive: true });
@@ -281,19 +308,20 @@ function setUpStatusBar(context) {
 
 function activate(context) {
   const changed = new vscode.EventEmitter();
+  syncSettings();
   const renderStatus = setUpStatusBar(context);
 
   context.subscriptions.push(
     vscode.lm.registerMcpServerDefinitionProvider("agent-bridge.servers", {
       onDidChangeMcpServerDefinitions: changed.event,
       provideMcpServerDefinitions: () => [
-        new vscode.McpStdioServerDefinition({
-          label: "Agent Bridge",
-          command: "node",
-          args: [serverPath(context)],
-          env: env(),
-          version: context.extension.packageJSON.version,
-        }),
+        new vscode.McpStdioServerDefinition(
+          "Agent Bridge",
+          process.execPath,
+          [serverPath(context)],
+          env(),
+          context.extension.packageJSON.version
+        ),
       ],
     })
   );
@@ -304,6 +332,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("agentBridge")) {
+        syncSettings();
         changed.fire();
         renderStatus();
       }

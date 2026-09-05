@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { client, sandbox, writeStub, wait } from "./helpers.mjs";
 
 /** Every test gets its own HOME and its own stub directory. */
@@ -18,6 +19,7 @@ test("handshake and tool listing", async () => {
   const c = client(env);
   const init = await c.init();
   assert.equal(init.result.serverInfo.name, "agent-bridge");
+  assert.equal(init.result.serverInfo.version, "0.9.1");
   // We echo the client's protocol version rather than insisting on our own.
   assert.equal(init.result.protocolVersion, "2025-06-18");
   assert.equal(init.result.capabilities.tools.listChanged, true);
@@ -61,11 +63,11 @@ test("effort tiers map to models and reasoning level", async () => {
 
   const fast = c.text(await c.call("ask_codex", { question: "q", effort: "fast" }));
   assert.match(fast, /-m small-model/);
-  assert.match(fast, /model_reasoning_effort="low"/);
+  assert.match(fast, /model_reasoning_effort=low/);
 
   const deep = c.text(await c.call("ask_codex", { question: "q", effort: "deep" }));
   assert.match(deep, /-m big-model/);
-  assert.match(deep, /model_reasoning_effort="high"/);
+  assert.match(deep, /model_reasoning_effort=high/);
 
   // No effort given means balanced, not "whatever was last used".
   const dflt = c.text(await c.call("ask_codex", { question: "q" }));
@@ -79,6 +81,17 @@ test("questions run read-only, delegations run workspace-write", async () => {
   await c.init();
   assert.match(c.text(await c.call("ask_codex", { question: "q" })), /--sandbox read-only/);
   assert.match(c.text(await c.call("delegate_to_codex", { task: "t" })), /--sandbox workspace-write/);
+  c.close();
+});
+
+test("ask_claude exposes only read tools and blocks MCP tools", async () => {
+  const { env } = setup({ echoArgs: true });
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("ask_claude", { question: "q" }));
+  assert.match(text, /--tools Read,Grep,Glob/);
+  assert.match(text, /--disallowedTools mcp__\*/);
+  assert.ok(!text.includes("--allowedTools"));
   c.close();
 });
 
@@ -109,6 +122,17 @@ test("a missing peer fails fast and says why", async () => {
   const res = await c.call("ask_codex", { question: "q" });
   assert.equal(res.result.isError, true);
   assert.match(c.text(res), /does not look installed|could not start/);
+  c.close();
+});
+
+test("a non-zero peer exit is a failure even when stdout contains a partial answer", async () => {
+  const { env } = setup({ stdout: "partial answer", stderr: "fatal detail", exit: 1 });
+  const c = client(env);
+  await c.init();
+  const res = await c.call("ask_codex", { question: "q" });
+  assert.equal(res.result.isError, true);
+  assert.match(c.text(res), /exited with code 1/);
+  assert.match(c.text(res), /partial answer/);
   c.close();
 });
 
@@ -182,6 +206,44 @@ test("a usage lookup never delays the answer", async () => {
   c.close();
 });
 
+test("documented app-server rate-limit fields appear in the usage footer", async () => {
+  const home = sandbox();
+  const binDir = path.join(home, "bin");
+  const codex = writeStub(binDir, "codex");
+  const claude = writeStub(binDir, "claude", { stdout: "ok" });
+  fs.writeFileSync(
+    path.join(binDir, "codex.stub.mjs"),
+    `import { createInterface } from "node:readline";
+const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+if (process.argv.includes("app-server")) {
+  createInterface({ input: process.stdin }).on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.id === 1) send({ jsonrpc: "2.0", id: 1, result: {} });
+    if (msg.id === 2) send({ jsonrpc: "2.0", id: 2, result: { rateLimits: { primary: { usedPercent: 25, windowDurationMins: 300 } } } });
+  });
+} else {
+  process.stdin.resume();
+  process.stdin.on("end", () => {
+    send({ type: "thread.started", thread_id: "0199a213-81c0-7800-8aa1-bbab2a035a53" });
+    send({ type: "item.completed", item: { type: "agent_message", text: "ok" } });
+    send({ type: "turn.completed", usage: {} });
+  });
+}
+`
+  );
+  const c = client({
+    HOME: home,
+    USERPROFILE: home,
+    AGENT_BRIDGE_CODEX_BIN: codex,
+    AGENT_BRIDGE_CLAUDE_BIN: claude,
+  });
+  await c.init();
+  await wait(250);
+  const text = c.text(await c.call("ask_codex", { question: "q" }));
+  assert.match(text, /Codex 5h 75% left/);
+  c.close();
+});
+
 test("the child is killed when the host goes away mid-call", async () => {
   const { env, home } = setup({ sleepMs: 4000, stdout: "finished anyway" });
   const marker = path.join(home, "survived.txt");
@@ -243,6 +305,30 @@ test("HTTP mode rejects a wrong secret and serves the right one", async () => {
   const body = await del.json();
   assert.ok(!/workspace-write/.test(JSON.stringify(body)), "remote delegation should be read-only by default");
 
+  const context = await post(`/mcp/${secret}`, {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: { name: "set_project_context", arguments: { content: "must not be written", cwd: home } },
+  });
+  const contextBody = await context.json();
+  assert.equal(contextBody.result.isError, true);
+  assert.equal(fs.existsSync(path.join(home, ".agent-bridge", "context.md")), false);
+
+  const marker = path.join(home, "remote-verify-marker");
+  const verified = await post(`/mcp/${secret}`, {
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      name: "delegate_to_codex",
+      arguments: { task: "t", cwd: home, verify: `python -c open('${marker}','w').write('x')` },
+    },
+  });
+  const verifiedBody = await verified.json();
+  assert.match(verifiedBody.result.content[0].text, /remote writes are disabled/);
+  assert.equal(fs.existsSync(marker), false);
+
   srv.kill();
 });
 
@@ -274,6 +360,20 @@ test("missing verify is called out rather than passing silently", async () => {
   c.close();
 });
 
+test("the working-tree report includes untracked files", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "repo-with-untracked");
+  fs.mkdirSync(repo, { recursive: true });
+  spawnSync("git", ["init", "--quiet"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "new-file.ts"), "export const value = 1;\n");
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "inspect", cwd: repo }));
+  assert.match(text, /\?\? new-file\.ts/);
+  assert.match(text, /already present before delegation/);
+  c.close();
+});
+
 test("background jobs run in parallel and are collected together", async () => {
   const { env } = setup({ stdout: "built it", sleepMs: 1500 });
   const c = client(env);
@@ -289,7 +389,7 @@ test("background jobs run in parallel and are collected together", async () => {
       ],
     })
   );
-  assert.match(start, /Started 3 Codex builds/);
+  assert.match(start, /Accepted 3 Codex builds: 3 running, 0 queued/);
   // Starting must return immediately; that is the entire point.
   assert.ok(Date.now() - started < 1000, "start_codex_jobs blocked");
 
@@ -301,20 +401,25 @@ test("background jobs run in parallel and are collected together", async () => {
   c.close();
 });
 
-test("jobs touching the same files are not started at once", async () => {
+test("overlapping jobs are queued across separate start calls", async () => {
   const { env } = setup({ stdout: "built it", sleepMs: 300 });
   const c = client(env);
   await c.init();
-  const start = c.text(
+  const first = c.text(
     await c.call("start_codex_jobs", {
-      tasks: [
-        { task: "one", files: "shared.ts" },
-        { task: "two", files: "shared.ts" },
-      ],
+      tasks: [{ task: "one", files: "src" }],
     })
   );
-  assert.match(start, /Started 1 Codex build/);
-  assert.match(start, /files overlap/);
+  const second = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [{ task: "two", files: "src/shared.ts" }],
+    })
+  );
+  assert.match(first, /1 running, 0 queued/);
+  assert.match(second, /0 running, 1 queued/);
+  const collected = c.text(await c.call("collect_codex_jobs", {}));
+  assert.match(collected, /job-1/);
+  assert.match(collected, /job-2/);
   c.close();
 });
 
@@ -352,18 +457,60 @@ test("an oversized project context is truncated rather than sent whole", async (
 
 test("a lane resumes an existing Codex session instead of starting cold", async () => {
   const { env, home } = setup({ echoArgs: true });
+  const repo = path.join(home, "repo");
+  fs.mkdirSync(repo, { recursive: true });
   fs.mkdirSync(path.join(home, ".agent-bridge"), { recursive: true });
   fs.writeFileSync(
     path.join(home, ".agent-bridge", "lanes.json"),
-    JSON.stringify({ "auth-refactor": { sessionId: "abc123-session", at: Date.now() } })
+    JSON.stringify({ scopes: { [repo]: { "auth-refactor": { sessionId: "abc123-session", at: Date.now() } } } })
   );
   const c = client(env);
   await c.init();
 
-  const resumed = c.text(await c.call("delegate_to_codex", { task: "next step", lane: "auth-refactor" }));
-  assert.match(resumed, /exec resume abc123-session/);
+  const resumed = c.text(await c.call("delegate_to_codex", { task: "next step", lane: "auth-refactor", cwd: repo }));
+  assert.match(resumed, /exec .*resume abc123-session/);
 
-  const cold = c.text(await c.call("delegate_to_codex", { task: "unrelated", lane: "other-lane" }));
+  const cold = c.text(await c.call("delegate_to_codex", { task: "unrelated", lane: "other-lane", cwd: repo }));
   assert.ok(!/resume/.test(cold), "an unknown lane should not resume anything");
+  c.close();
+});
+
+test("a documented Codex JSONL response supplies the final message and scoped lane id", async () => {
+  const sessionId = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+  const stdout = [
+    JSON.stringify({ type: "thread.started", thread_id: sessionId }),
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: "implemented cleanly" } }),
+    JSON.stringify({ type: "turn.completed", usage: {} }),
+  ].join("\n");
+  const { env, home } = setup({ stdout });
+  const repo = path.join(home, "jsonl-repo");
+  fs.mkdirSync(repo, { recursive: true });
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "build", lane: "feature", cwd: repo }));
+  assert.match(text, /codex said:\nimplemented cleanly/);
+  assert.ok(!text.includes("thread.started"));
+  const lanes = JSON.parse(fs.readFileSync(path.join(home, ".agent-bridge", "lanes.json"), "utf8"));
+  assert.equal(lanes.scopes[repo].feature.sessionId, sessionId);
+  c.close();
+});
+
+test("a verification process is killed when the MCP host closes", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "verify-shutdown");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, "check.py"),
+    "import pathlib,time\npathlib.Path('started').write_text('yes')\ntime.sleep(1.5)\npathlib.Path('survived').write_text('yes')\n"
+  );
+  const c = client(env);
+  await c.init();
+  c.call("delegate_to_codex", { task: "t", cwd: repo, verify: "python check.py" }).catch(() => {});
+  for (let i = 0; i < 100 && !fs.existsSync(path.join(repo, "started")); i++) await wait(25);
+  assert.equal(fs.existsSync(path.join(repo, "started")), true);
+  c.proc.stdin.end();
+  await wait(1800);
+  assert.equal(fs.existsSync(path.join(repo, "survived")), false);
   c.close();
 });

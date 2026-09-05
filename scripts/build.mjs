@@ -45,7 +45,7 @@ function syncVersions() {
   }
   // The server reports its own version over the protocol, so it has to match too.
   const src = fs.readFileSync(SERVER, "utf8");
-  const patched = src.replace(/version: "\d+\.\d+\.\d+"/, `version: "${VERSION}"`);
+  const patched = src.replace(/const SERVER_VERSION = "\d+\.\d+\.\d+";/, `const SERVER_VERSION = "${VERSION}";`);
   if (patched !== src) {
     fs.writeFileSync(SERVER, patched);
     log(`synced src/agent-bridge.mjs to ${VERSION}`);

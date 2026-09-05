@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.1
+
+- Fixed VS Code MCP registration to use the public positional constructor and
+  the extension host's Node.js executable.
+- Codex calls now consume the documented JSONL event stream. Final messages and
+  session IDs are parsed explicitly; lanes are scoped to their repository.
+- A non-zero or signalled CLI exit is always reported as a failure, even if the
+  process emitted partial stdout.
+- Remote read-only mode now blocks project-context writes and host verification
+  commands as well as running Codex in its read-only sandbox.
+- Background jobs use a server-wide path scheduler. Overlapping paths queue
+  across separate calls, while independent jobs continue in parallel.
+- Working-tree reports include untracked files and label entries that existed
+  before delegation.
+- `ask_claude` now restricts built-in tools with `--tools` and blocks MCP tools.
+- Verification processes participate in shutdown and MCP cancellation cleanup.
+- Windows command launches reject shell metacharacters in executable paths and
+  arguments before invoking required `.cmd` shims through `cmd.exe`.
+- Codex usage parsing follows the current app-server camelCase response and its
+  initialize/initialized handshake, while keeping compatibility with older
+  snake_case records.
+- VS Code settings are saved for bridge processes launched by Codex and Claude
+  Code after CLI registration.
+- Expanded the integration suite from 23 to 30 tests and documented setup,
+  trust boundaries, normal workflow and remaining limitations.
+
 ## 0.9.0
 
 - Shared project context: `.agent-bridge/context.md` in the repository is

@@ -13,7 +13,7 @@ scripts/build.mjs           copies src/ into both packages and packs them
 test/                       node:test suite, drives the real server over stdio
 ```
 
-`src/agent-bridge.mjs` is the only copy that gets edited. The build copies it into
+`src/agent-bridge.mjs` is the only server copy that gets edited. The build copies it into
 each package; those copies are gitignored. If you find yourself editing a file
 under `packages/*/server/`, stop, that change will be overwritten.
 
@@ -47,10 +47,10 @@ against `^[A-Za-z0-9._:-]+$` first. Do not add a second one without the same
 check.
 
 **CLI flags drift.** Both Codex and Claude Code change flags between releases. If
-calls start returning nothing, compare the `args` arrays against `codex exec
---help` and `claude --help` before looking anywhere else. `codex exec -` for
-reading the prompt from stdin is the flag most worth checking; `AGENT_BRIDGE_CODEX_STDIN=0`
-falls back to argv.
+calls fail, compare the `args` arrays against `codex exec --help` and `claude
+--help`. Codex calls request JSONL with `--json`; `thread.started` supplies the
+lane session ID and the last completed `agent_message` supplies returned text.
+Keep the plain-text fallback for old releases and test doubles.
 
 **Tool descriptions are the prompt.** They are what decides whether the calling
 model reaches for a tool and when. Editing them is a behaviour change, not a docs
@@ -63,10 +63,10 @@ watching. There is a test for this; keep it passing.
 ## The verify path runs a model-supplied command
 
 `delegate_to_codex` and the job tools accept a `verify` command and the bridge
-runs it. That is a step beyond spawning a fixed CLI, so: only the first token is
-matched, only against `AGENT_BRIDGE_VERIFY_ALLOW`, and on Windows the tokens go
-to cmd.exe separately so `&`, `|` and `>` cannot act as operators. If you widen
-this, keep all three properties.
+runs it. That is a step beyond spawning a fixed CLI, so only the first token is
+matched against `AGENT_BRIDGE_VERIFY_ALLOW`. POSIX starts the executable directly.
+Windows `.cmd` shims require `cmd.exe`, so every token containing a shell
+metacharacter is rejected. If you widen this, keep both controls.
 
 ## Testing philosophy
 
@@ -91,8 +91,9 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
   much for a status line.
 - **Retry or fall back to another provider.** A failed peer fails visibly, and
   after two failures in a session the tool stops calling it.
-- **Enforce permissions.** MCPB has no permissions model and neither does this.
-  The safety is the sandbox flags passed to the CLIs, nothing structural.
+- **Provide a general permissions system.** The bridge applies fixed safety
+  boundaries: CLI sandboxes, a verification allowlist and stricter remote-mode
+  behavior. It does not implement user identities or per-tool authorization.
 
 ## Unverified
 
@@ -103,3 +104,17 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
   that can drop them.
 - The Codex desktop app reportedly shares MCP config with the Codex CLI. Sources
   conflict. The CLI and IDE extension are certain; the desktop app is not.
+
+
+## Coordination and remote access
+
+Background job claims are server-wide and use normalized absolute paths. A
+directory overlaps its descendants. Missing paths and globs claim the entire
+workspace. Preserve that conservative behavior when changing the scheduler.
+Queued jobs must resolve as failures during shutdown; otherwise they can start
+after the host has disappeared.
+
+`AGENT_BRIDGE_REMOTE_WRITES=0` applies to every direct write path, not only the
+Codex sandbox. Project-context writes are hidden and rejected, and verification
+commands are skipped. Any new tool that writes outside Codex must set
+`requiresWrites: true` and receive a remote-mode test.

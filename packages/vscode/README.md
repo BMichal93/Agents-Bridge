@@ -1,47 +1,45 @@
 # Agent Bridge
 
-Hands coding work to OpenAI Codex from Claude and Copilot, and gets second
-opinions from it. Install, and it works until you disable it.
-
-## What you get
-
-| Tool | What it does | Writes files |
-| --- | --- | --- |
-| `ask_codex` | Ask Codex a question | no |
-| `delegate_to_codex` | Hand Codex a unit of work to carry out | yes |
-| `ask_claude` | Ask Claude Code a question | no |
-
-Each takes an `effort` of `fast`, `balanced` or `deep`, chosen from the task.
-Delegations come back with Codex's summary plus `git diff --stat`, so the calling
-agent can check what actually changed instead of trusting the summary.
+Agent Bridge lets Claude, Codex and VS Code cooperate through local MCP tools.
+Claude can delegate a self-contained implementation to the signed-in Codex CLI;
+Codex and VS Code can ask the signed-in Claude Code CLI for a read-only review.
 
 ## Requirements
 
-The Codex CLI installed and signed in. Claude Code too, if you want `ask_claude`.
-This extension does not talk to any API itself; it runs the CLIs you already have.
+- Node.js 18 or newer
+- Codex CLI installed and signed in
+- Claude Code installed and signed in for `ask_claude`
 
-## Settings
+The extension sends no API requests and reads no authentication tokens. It
+launches your existing CLIs, which retain ownership of authentication.
 
-- **Default project** - folder Codex runs in when a request does not name one.
-  Blank uses the open workspace.
-- **Conserve mode** - makes delegating the default rather than the exception. Turn
-  it on when you are short on Claude usage. There is a command for it too.
-- **Codex path / Claude path** - only needed if they are not on your PATH.
+## Setup
 
-## Codex and Claude Code
+Install the VSIX, then accept the one-time prompt to enable Agent Bridge for the
+Codex and Claude Code CLIs. Existing CLI sessions must be restarted. The command
+palette also provides commands to enable, remove, configure and inspect the
+bridge.
 
-VS Code starts and stops the MCP server with this extension, so disabling the
-extension really does turn it off and no config file is edited. The Codex and
-Claude Code CLIs keep their own config and cannot be reached that way, so the
-extension offers once to register there as well. Undo with **Agent Bridge: Remove
-from Codex and Claude Code**.
+## Tools
 
-## What it does not do
+| Tool | Purpose |
+| --- | --- |
+| `ask_codex` | Read-only Codex question or review |
+| `delegate_to_codex` | One workspace-writing Codex implementation |
+| `start_codex_jobs` | Concurrent builds with overlap queueing |
+| `collect_codex_jobs` | Collect background results |
+| `set_project_context` | Save repository context used by later handoffs |
+| `ask_claude` | Claude Code question with read-only built-in tools |
 
-- It cannot see how much Claude usage you have left. No MCP server can; nothing in
-  the protocol exposes it. Conserve mode is a switch you flip, not a detection.
-- It does not retry silently or fall back to another provider. If Codex is
-  uninstalled, signed out or out of quota, the call fails fast with the likely
-  reason, and after two failures in a session it stops calling it at all.
-- It has no permissions model beyond the sandboxes it passes to the CLIs. Codex
-  runs read-only for questions and `workspace-write` for delegations.
+Give delegations a complete task, exact files, constraints, acceptance criteria,
+a verification command and a lane name. Results place the verification verdict
+first, followed by the repository's working-tree status, including untracked and
+pre-existing entries.
+
+Settings configured in VS Code are saved for bridge processes later launched by
+the CLIs. Disabling the VS Code extension stops its VS Code MCP server; use
+**Agent Bridge: Remove from Codex and Claude Code** to remove persistent CLI
+registrations.
+
+The full setup guide, security behavior and limitations are in the repository
+README.

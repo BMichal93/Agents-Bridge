@@ -2,9 +2,12 @@
 /**
  * agent-bridge - single file, no dependencies, no install step.
  *
- * Exposes three MCP tools over stdio:
+ * Exposes six MCP tools over stdio:
  *   ask_codex          -> ask Codex a question (read-only, no file changes)
  *   delegate_to_codex  -> hand Codex a unit of work to actually do (writes files)
+ *   start_codex_jobs    -> queue independent Codex implementation jobs
+ *   collect_codex_jobs  -> wait for background Codex jobs and return results
+ *   set_project_context -> save context prepended to future delegations
  *   ask_claude         -> ask Claude Code a question (read-only), for the reverse direction
  *
  * Drop it anywhere (say C:\tools\agent-bridge.mjs) and point every MCP host at
@@ -26,16 +29,15 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
+const SERVER_VERSION = "0.9.1";
 
 // Questions come back in a minute or two. Real work takes longer, so the two
 // paths get separate budgets rather than one compromise value.
 const ASK_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_TIMEOUT_MS) || 300_000;
 const DELEGATE_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_DELEGATE_TIMEOUT_MS) || 1_800_000;
-
-const CLAUDE_BIN = process.env.AGENT_BRIDGE_CLAUDE_BIN || "claude";
-const CODEX_BIN = process.env.AGENT_BRIDGE_CODEX_BIN || "codex";
 
 // Everything this server returns lands in the calling agent's context window and
 // stays there for the rest of the session. Offloading work to the other agent
@@ -54,6 +56,19 @@ const CLAUDE_MODEL = process.env.AGENT_BRIDGE_CLAUDE_MODEL || "";
 const STATE_DIR = path.join(os.homedir(), ".agent-bridge");
 const MODELS_FILE = path.join(STATE_DIR, "models.json");
 const CONSERVE_FILE = path.join(STATE_DIR, "conserve");
+const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
+
+function loadSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+const savedSettings = loadSettings();
+const CLAUDE_BIN = process.env.AGENT_BRIDGE_CLAUDE_BIN || savedSettings.claudePath || "claude";
+const CODEX_BIN = process.env.AGENT_BRIDGE_CODEX_BIN || savedSettings.codexPath || "codex";
 
 /**
  * Effort tiers instead of model names.
@@ -92,11 +107,14 @@ function loadModels() {
 // at the bottom for how running hosts find out.
 // The env var exists so packaged installs can set it: a .mcpb manifest and a
 // plugin manifest can pass environment, but neither can create a file.
-const conserveOn = () => process.env.AGENT_BRIDGE_CONSERVE === "1" || fs.existsSync(CONSERVE_FILE);
+const conserveOn = () =>
+  process.env.AGENT_BRIDGE_CONSERVE === "1" ||
+  (process.env.AGENT_BRIDGE_CONSERVE === undefined && savedSettings.conserveMode === true) ||
+  fs.existsSync(CONSERVE_FILE);
 
 // The Claude desktop app has no project context, so without this every question
 // would have to carry an absolute path. Extensions set it once at install time.
-const DEFAULT_CWD = process.env.AGENT_BRIDGE_DEFAULT_CWD || "";
+const DEFAULT_CWD = process.env.AGENT_BRIDGE_DEFAULT_CWD || savedSettings.defaultProject || "";
 
 // A model name reaches argv, unlike the prompt, so it gets checked. Anything with
 // a space, quote or shell metacharacter in it is not a model name.
@@ -158,6 +176,7 @@ const DEPTH = Number(process.env.AGENT_BRIDGE_DEPTH) || 0;
 
 const log = (msg) => process.stderr.write(`[agent-bridge] ${msg}\n`);
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+const safeForWindowsCmd = (value) => !/[&|<>^%!()"\r\n]/.test(value);
 
 // ---------------------------------------------------------------------------
 // Running the other agent
@@ -179,6 +198,33 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // nobody watching, because on Windows killing the shim does not kill the shell
 // it spawned.
 const liveChildren = new Set();
+const requestScope = new AsyncLocalStorage();
+const requestChildren = new Map();
+
+function trackChild(child) {
+  liveChildren.add(child);
+  const requestId = requestScope.getStore();
+  if (requestId === undefined) return;
+  if (!requestChildren.has(requestId)) requestChildren.set(requestId, new Set());
+  requestChildren.get(requestId).add(child);
+}
+
+function untrackChild(child) {
+  liveChildren.delete(child);
+  for (const [requestId, children] of requestChildren) {
+    children.delete(child);
+    if (!children.size) requestChildren.delete(requestId);
+  }
+}
+
+function cancelRequest(requestId) {
+  for (const child of requestChildren.get(requestId) || []) {
+    try {
+      killTree(child);
+    } catch {}
+  }
+  requestChildren.delete(requestId);
+}
 
 function killTree(child) {
   if (!child.pid) return;
@@ -208,6 +254,12 @@ function shutdown() {
       killTree(child);
     } catch {}
   }
+  for (const job of pendingJobs.splice(0)) {
+    job.status = "failed";
+    job.seconds = 0;
+    job.text = "Codex job cancelled because the MCP host closed.";
+    job.resolve(job);
+  }
   // Small grace period so anything already written to stdout gets flushed before
   // the process goes away. Exiting on the same tick truncates the last reply.
   setTimeout(() => process.exit(0), 150);
@@ -219,8 +271,47 @@ process.stdin.on("close", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-function runAgent(bin, args, prompt, cwd, timeoutMs) {
+function parseCodexJsonLines(output) {
+  const messages = [];
+  const errors = [];
+  let sessionId = null;
+  let sawJsonEvent = false;
+  let failed = false;
+
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (!event || typeof event.type !== "string") continue;
+      sawJsonEvent = true;
+      if (event.type === "thread.started" && typeof event.thread_id === "string") sessionId = event.thread_id;
+      if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
+        messages.push(event.item.text);
+      }
+      if (event.type === "turn.failed" || event.type === "error") {
+        failed = true;
+        const detail = event.error?.message || event.message || event.error;
+        if (detail) errors.push(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+    } catch {
+      // Older Codex releases and test doubles may still emit plain text.
+    }
+  }
+
+  if (!sawJsonEvent) return { text: output.trim(), sessionId: null, failed: false, errors: "" };
+  return {
+    text: messages.at(-1)?.trim() || errors.join("\n") || "(Codex returned no final message)",
+    sessionId,
+    failed,
+    errors: errors.join("\n"),
+  };
+}
+
+function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {}) {
   return new Promise((resolve) => {
+    if (IS_WINDOWS && [bin, ...args].some((value) => !safeForWindowsCmd(value))) {
+      return resolve({ ok: false, text: "(refused command containing Windows shell metacharacters)" });
+    }
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : bin;
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", bin, ...args] : args;
 
@@ -233,7 +324,7 @@ function runAgent(bin, args, prompt, cwd, timeoutMs) {
       env: { ...process.env, AGENT_BRIDGE_DEPTH: String(DEPTH + 1), NO_COLOR: "1" },
     });
 
-    liveChildren.add(child);
+    trackChild(child);
 
     let out = "";
     let err = "";
@@ -242,7 +333,7 @@ function runAgent(bin, args, prompt, cwd, timeoutMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      liveChildren.delete(child);
+      untrackChild(child);
       resolve(result);
     };
 
@@ -259,12 +350,20 @@ function runAgent(bin, args, prompt, cwd, timeoutMs) {
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d)); // both CLIs stream progress here
     child.on("error", (e) => finish({ ok: false, text: `(could not start ${bin}: ${e.message})`, raw: e.message }));
-    child.on("close", () => {
-      const text = out.trim();
-      if (text) return finish({ ok: true, text });
-      // Empty stdout means it failed. The last few stderr lines say why.
-      const tail = err.trim().split("\n").slice(-12).join("\n");
-      finish({ ok: false, text: `(${bin} returned nothing)\n${tail}`, raw: tail });
+    child.on("close", (code, signal) => {
+      const parsed = codexJson ? parseCodexJsonLines(out) : { text: out.trim(), sessionId: null, failed: false, errors: "" };
+      const stderrTail = err.trim().split("\n").slice(-12).join("\n");
+      const ok = code === 0 && !signal && !parsed.failed;
+      if (ok && parsed.text) return finish({ ok: true, text: parsed.text, sessionId: parsed.sessionId });
+
+      const reason = signal ? `terminated by ${signal}` : `exited with code ${code ?? "unknown"}`;
+      const details = [parsed.text, parsed.errors, stderrTail].filter(Boolean).join("\n");
+      finish({
+        ok: false,
+        text: `(${bin} ${reason})${details ? `\n${details}` : ""}`,
+        raw: [parsed.errors, stderrTail].filter(Boolean).join("\n") || details,
+        sessionId: parsed.sessionId,
+      });
     });
 
     child.stdin.on("error", () => {}); // the child may exit before we finish writing
@@ -276,21 +375,29 @@ function runAgent(bin, args, prompt, cwd, timeoutMs) {
  * After a write-mode delegation, report what actually changed on disk.
  *
  * The point is to stop the calling agent from taking the other one's summary at
- * face value. A model saying "I updated the repository layer" and `git diff`
- * saying three files changed are different claims, and only one is checkable.
+ * face value. A model saying "I updated the repository layer" and Git status
+ * showing three files changed are different claims, and only one is checkable.
  */
-function gitSummary(cwd) {
+function gitSnapshot(cwd) {
   return new Promise((resolve) => {
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "git";
-    const gitArgs = ["--no-pager", "diff", "--stat", "HEAD"];
+    const gitArgs = ["status", "--short", "--untracked-files=all"];
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", "git", ...gitArgs] : gitArgs;
     const child = spawn(file, argv, { cwd: cwd || DEFAULT_CWD || process.cwd(), stdio: ["ignore", "pipe", "ignore"] });
     let out = "";
     child.stdout.on("data", (d) => (out += d));
     child.on("error", () => resolve(null)); // not a git repo, or no git: skip silently
-    child.on("close", () => resolve(out.trim() || null));
+    child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
     setTimeout(() => child.kill(), 10_000);
   });
+}
+
+function formatGitSummary(before, after) {
+  if (after === null) return "(no git status available: not a git repository, or git is not on PATH)";
+  if (!after) return "working tree after delegation: clean";
+  const parts = [`working tree after delegation:\n${after}`];
+  if (before) parts.push(`already present before delegation:\n${before}`);
+  return parts.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -345,28 +452,28 @@ function codexArgs({ write, prompt, model, effort, resumeId }) {
   // -c applies a one-off config override for this run only, so a deep task can
   // think harder without changing the setting for your interactive sessions.
   const reasoning =
-    chosen.reasoning && SAFE_MODEL.test(chosen.reasoning) ? ["-c", `model_reasoning_effort="${chosen.reasoning}"`] : [];
+    chosen.reasoning && SAFE_MODEL.test(chosen.reasoning) ? ["-c", `model_reasoning_effort=${chosen.reasoning}`] : [];
   const args = [
     ...approvalArgs(),
     ...reasoning,
     "exec",
-    // `resume <id>` continues an existing Codex thread. It has to come straight
-    // after exec, before the stdin marker.
-    ...(resumeId ? ["resume", resumeId] : []),
-    ...(CODEX_STDIN ? ["-"] : []),
     "--sandbox",
     write ? "workspace-write" : "read-only",
     "--skip-git-repo-check",
+    "--json",
     ...modelArgs("-m", model, chosen.model || CODEX_MODEL),
+    ...(!write ? ["--ephemeral"] : []),
+    // Exec options belong before its optional `resume` subcommand.
+    ...(resumeId ? ["resume", resumeId] : []),
+    ...(CODEX_STDIN ? ["-"] : []),
   ];
-  if (!write) args.push("--ephemeral"); // no session files for a throwaway question
   if (!CODEX_STDIN) args.push(prompt);
   return args;
 }
 
 async function askCodex({ question, cwd, model, effort }) {
   const prompt = askFrame(question);
-  return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS);
+  return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS, { codexJson: true });
 }
 
 async function delegateToCodex({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes, lane }) {
@@ -375,29 +482,34 @@ async function delegateToCodex({ task, files, constraints, acceptance, verify: v
   // turned on deliberately rather than inherited from the local behaviour.
   const write = REMOTE_MODE ? REMOTE_WRITES && allow_writes !== false : true;
 
-  const resumeId = lane && RESUME_ENABLED ? loadLanes()[lane]?.sessionId : null;
+  const resumeId = lane && RESUME_ENABLED ? loadLane(lane, cwd)?.sessionId : null;
   const prompt = delegateFrame({ task, files, constraints, acceptance, verify: verifyCommand, cwd, resuming: Boolean(resumeId) });
-
-  // Snapshot before the run so we can tell which session was created by it. The
-  // set difference is reliable even with several builds running at once, where
-  // "newest file" would not be.
-  const before = lane && RESUME_ENABLED && !resumeId ? rolloutIds() : null;
-  const r = await runAgent(CODEX_BIN, codexArgs({ write, prompt, model, effort, resumeId }), prompt, cwd, DELEGATE_TIMEOUT_MS);
-  if (before) {
-    const fresh = [...rolloutIds()].filter((id) => !before.has(id));
-    if (fresh.length === 1) saveLane(lane, fresh[0]);
-  }
+  const before = await gitSnapshot(cwd);
+  const r = await runAgent(
+    CODEX_BIN,
+    codexArgs({ write, prompt, model, effort, resumeId }),
+    prompt,
+    cwd,
+    DELEGATE_TIMEOUT_MS,
+    { codexJson: true }
+  );
+  if (lane && RESUME_ENABLED && !resumeId && r.sessionId) saveLane(lane, r.sessionId, cwd);
   // Ask git what changed even when the run failed: a delegation that died partway
   // through still leaves edits behind, and that is exactly when you want to know.
-  const diff = await gitSummary(cwd);
-  const verify = verifyCommand ? await runVerify(verifyCommand, cwd) : null;
+  const after = await gitSnapshot(cwd);
+  const diff = formatGitSummary(before, after);
+  const verify = verifyCommand
+    ? REMOTE_MODE && !REMOTE_WRITES
+      ? { ran: false, text: "verify skipped: remote writes are disabled, so host commands are not allowed" }
+      : await runVerify(verifyCommand, cwd)
+    : null;
 
   // Verdict first, then what changed, then the builder's own words last. The
   // caller should be able to stop reading after two lines when it passed.
   const parts = [];
   if (verify) parts.push(verify.text);
-  parts.push(diff ? `changed:\n${diff}` : "(no git diff available: not a git repository, or git is not on PATH)");
-  if (!verify) parts.push("No verify command was given, so nothing here confirms the change works. Read the diff.");
+  parts.push(diff);
+  if (!verify) parts.push("No verify command was given, so nothing here confirms the change works. Inspect the working tree.");
   parts.push(`codex said:\n${r.text}`);
   return { ...r, ok: r.ok && (!verify || !verify.ran || verify.ok), text: parts.join("\n\n") };
 }
@@ -407,7 +519,14 @@ async function askClaude({ question, cwd, model, effort }) {
   // than it looks: in print mode there is no human to answer a permission
   // prompt, so a tool outside the list is denied rather than hanging.
   const chosen = resolveEffort("claude", effort);
-  const args = ["-p", "--allowedTools", "Read,Grep,Glob", ...modelArgs("--model", model, chosen.model || CLAUDE_MODEL)];
+  const args = [
+    "-p",
+    "--tools",
+    "Read,Grep,Glob",
+    "--disallowedTools",
+    "mcp__*",
+    ...modelArgs("--model", model, chosen.model || CLAUDE_MODEL),
+  ];
   return runAgent(CLAUDE_BIN, args, askFrame(question), cwd, ASK_TIMEOUT_MS);
 }
 
@@ -449,10 +568,10 @@ function readProjectContext(cwd) {
 // already read and the decisions it already made. That is the difference between
 // five independent cold starts and one build conversation.
 //
-// The session id is captured by watching which rollout file appears, rather than
-// by parsing Codex's event stream, because the stream format is version-specific
-// and the file naming has been stable. Set AGENT_BRIDGE_CODEX_RESUME=0 if your
-// Codex build does not support `exec resume`.
+// Codex's documented JSONL stream reports the session id in `thread.started`.
+// Lane state is scoped by repository so the same friendly lane name can be used
+// in unrelated projects without resuming the wrong conversation. Set
+// AGENT_BRIDGE_CODEX_RESUME=0 if your Codex build does not support `exec resume`.
 // ---------------------------------------------------------------------------
 
 const RESUME_ENABLED = process.env.AGENT_BRIDGE_CODEX_RESUME !== "0";
@@ -466,36 +585,23 @@ function loadLanes() {
   }
 }
 
-function saveLane(lane, sessionId) {
+const laneScope = (cwd) => path.resolve(cwd || DEFAULT_CWD || process.cwd());
+
+function loadLane(lane, cwd) {
+  const saved = loadLanes();
+  return saved.scopes?.[laneScope(cwd)]?.[lane] || null;
+}
+
+function saveLane(lane, sessionId, cwd) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const lanes = loadLanes();
-    lanes[lane] = { sessionId, at: Date.now() };
+    if (!lanes.scopes || typeof lanes.scopes !== "object") lanes.scopes = {};
+    const scope = laneScope(cwd);
+    if (!lanes.scopes[scope] || typeof lanes.scopes[scope] !== "object") lanes.scopes[scope] = {};
+    lanes.scopes[scope][lane] = { sessionId, at: Date.now() };
     fs.writeFileSync(LANES_FILE, JSON.stringify(lanes, null, 2));
   } catch {}
-}
-
-/** Every rollout file that exists right now, by session id. */
-function rolloutIds() {
-  const ids = new Set();
-  const walk = (dir, depth) => {
-    if (depth > 4) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (e.isDirectory()) walk(path.join(dir, e.name), depth + 1);
-      else {
-        const m = e.name.match(/^rollout-.*?-([0-9a-fA-F-]{8,})\.jsonl$/);
-        if (m) ids.add(m[1]);
-      }
-    }
-  };
-  walk(path.join(os.homedir(), ".codex", "sessions"), 0);
-  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -524,18 +630,22 @@ function runVerify(command, cwd) {
     if (!VERIFY_ALLOWLIST.includes(head)) {
       return resolve({ ran: false, text: `verify skipped: "${head}" is not in the allowlist (${VERIFY_ALLOWLIST.join(", ")})` });
     }
+    if (IS_WINDOWS && parts.some((part) => !safeForWindowsCmd(part))) {
+      return resolve({ ran: false, text: "verify skipped: shell metacharacters are not allowed on Windows" });
+    }
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : parts[0];
-    // The command came from a model, so on Windows it must not be handed to
-    // cmd.exe as one string where &, | and > would be operators. Each token goes
-    // across separately, and the head is already allowlisted.
+    // The command came from a model. On Windows .cmd shims require cmd.exe, so
+    // metacharacters were rejected above before the allowlisted command is run.
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", ...parts] : parts.slice(1);
     const child = spawn(file, argv, { cwd: cwd || DEFAULT_CWD || process.cwd(), stdio: ["ignore", "pipe", "pipe"], detached: !IS_WINDOWS });
+    trackChild(child);
     let out = "";
     let done = false;
     const finish = (v) => {
       if (done) return;
       done = true;
       clearTimeout(t);
+      untrackChild(child);
       resolve(v);
     };
     const t = setTimeout(() => {
@@ -565,18 +675,69 @@ function runVerify(command, cwd) {
 
 const jobs = new Map();
 let jobCounter = 0;
+const pendingJobs = [];
+const runningClaims = new Map();
 
-function startJob(spec) {
-  const id = `job-${++jobCounter}`;
-  const job = { id, task: spec.task.slice(0, 80), status: "running", startedAt: Date.now() };
-  jobs.set(id, job);
-  job.promise = (async () => {
-    const r = await delegateToCodex(spec);
-    job.status = r.ok ? "done" : "failed";
-    job.seconds = Math.round((Date.now() - job.startedAt) / 1000);
-    job.text = r.text;
-    return job;
+function claimsFor(spec) {
+  const base = spec.cwd || DEFAULT_CWD || process.cwd();
+  const declared = (spec.files || "*").split(/[\n,]+/).map((x) => x.trim()).filter(Boolean);
+  if (!declared.length || declared.some((x) => x === "*" || /[*?\[\]]/.test(x))) return ["*"];
+  return declared.map((file) => path.resolve(base, file));
+}
+
+function claimsOverlap(left, right) {
+  if (left.includes("*") || right.includes("*")) return true;
+  return left.some((a) =>
+    right.some((b) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep))
+  );
+}
+
+function canStart(job) {
+  return ![...runningClaims.values()].some((claims) => claimsOverlap(job.claims, claims));
+}
+
+function launchJob(job) {
+  job.status = "running";
+  job.startedAt = Date.now();
+  runningClaims.set(job.id, job.claims);
+  (async () => {
+    try {
+      const r = await delegateToCodex(job.spec);
+      job.status = r.ok ? "done" : "failed";
+      job.text = r.text;
+    } catch (e) {
+      job.status = "failed";
+      job.text = `Codex job failed inside agent-bridge: ${e.message || e}`;
+    } finally {
+      job.seconds = Math.round((Date.now() - job.startedAt) / 1000);
+      runningClaims.delete(job.id);
+      job.resolve(job);
+      pumpQueue();
+    }
   })();
+}
+
+function pumpQueue() {
+  if (shuttingDown) return;
+  for (let i = 0; i < pendingJobs.length; ) {
+    const job = pendingJobs[i];
+    if (!canStart(job)) {
+      i++;
+      continue;
+    }
+    pendingJobs.splice(i, 1);
+    launchJob(job);
+  }
+}
+
+function enqueueJob(spec) {
+  const id = `job-${++jobCounter}`;
+  let resolve;
+  const promise = new Promise((done) => (resolve = done));
+  const job = { id, task: spec.task.slice(0, 80), status: "queued", spec, claims: claimsFor(spec), promise, resolve };
+  jobs.set(id, job);
+  pendingJobs.push(job);
+  pumpQueue();
   return job;
 }
 
@@ -585,7 +746,8 @@ function startJob(spec) {
 //
 // Three routes exist to Codex rate limits, and they are not equally good:
 //
-//   1. `codex app-server --stdio` and the account/rateLimits/read method. Codex
+//   1. `codex app-server` over its default stdio transport and the
+//      account/rateLimits/read method. Codex
 //      owns the authentication, so nothing here touches your token. Preferred,
 //      but the method name is internal and can move between versions.
 //   2. The ChatGPT backend usage endpoint with the token from ~/.codex/auth.json.
@@ -612,22 +774,39 @@ function windowLabel(seconds) {
 
 function shapeUsage(rateLimit, source, asOf) {
   if (!rateLimit) return null;
+  const bucket = rateLimit.rateLimits || rateLimit.rate_limits || rateLimit;
   const windows = [];
   for (const key of ["primary_window", "secondary_window", "primary", "secondary"]) {
-    const w = rateLimit[key];
-    if (!w || typeof w.used_percent !== "number") continue;
-    const seconds = w.limit_window_seconds || (w.window_minutes ? w.window_minutes * 60 : 0);
-    windows.push({ label: windowLabel(seconds), remaining: Math.max(0, Math.round(100 - w.used_percent)) });
+    const w = bucket[key];
+    const used = w?.usedPercent ?? w?.used_percent;
+    if (!w || typeof used !== "number") continue;
+    const seconds =
+      w.limit_window_seconds ||
+      (w.window_minutes ? w.window_minutes * 60 : 0) ||
+      (w.windowDurationMins ? w.windowDurationMins * 60 : 0);
+    windows.push({ label: windowLabel(seconds), remaining: Math.max(0, Math.round(100 - used)) });
   }
   if (!windows.length) return null;
-  return { plan: rateLimit.plan_type || null, windows, source, asOf };
+  return { plan: rateLimit.planType || rateLimit.plan_type || bucket.planType || bucket.plan_type || null, windows, source, asOf };
+}
+
+function usageFromResult(result, source, asOf) {
+  if (!result) return null;
+  const byId = result.rateLimitsByLimitId || result.rate_limits_by_limit_id;
+  if (byId && typeof byId === "object") {
+    const preferred = byId.codex || Object.values(byId)[0];
+    const shaped = shapeUsage(preferred, source, asOf);
+    if (shaped) return shaped;
+  }
+  return shapeUsage(result.rateLimits || result.rate_limits || result.rate_limit || result, source, asOf);
 }
 
 /** Ask the Codex app-server. Short timeout: this is a status line, not the task. */
 function usageFromAppServer() {
   return new Promise((resolve) => {
+    if (IS_WINDOWS && !safeForWindowsCmd(CODEX_BIN)) return resolve(null);
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : CODEX_BIN;
-    const args = ["app-server", "--stdio"];
+    const args = ["app-server"];
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", CODEX_BIN, ...args] : args;
     let child;
     try {
@@ -636,7 +815,10 @@ function usageFromAppServer() {
       return resolve(null);
     }
     let out = "";
+    let done = false;
     const finish = (v) => {
+      if (done) return;
+      done = true;
       clearTimeout(timer);
       try {
         killTree(child);
@@ -647,20 +829,24 @@ function usageFromAppServer() {
     child.on("error", () => finish(null));
     child.stdout.on("data", (d) => {
       out += d;
-      for (const line of out.split("\n")) {
+      let newline;
+      while ((newline = out.indexOf("\n")) >= 0) {
+        const line = out.slice(0, newline);
+        out = out.slice(newline + 1);
         if (!line.trim()) continue;
         try {
           const m = JSON.parse(line);
-          if (m.id === 2 && m.result) return finish(shapeUsage(m.result.rate_limit || m.result, "codex app-server", Date.now()));
+          if (m.id === 1 && m.result) {
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} }) + "\n");
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) + "\n");
+          }
+          if (m.id === 2 && m.result) return finish(usageFromResult(m.result, "codex app-server", Date.now()));
           if (m.id === 2 && m.error) return finish(null);
         } catch {}
       }
     });
     child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.9.0" } } }) +
-        "\n" +
-        JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) +
-        "\n"
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: SERVER_VERSION } } }) + "\n"
     );
   });
 }
@@ -698,11 +884,17 @@ function usageFromRollouts() {
       continue;
     }
     for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].includes("rate_limits")) continue;
+      if (!lines[i].includes("rate_limits") && !lines[i].includes("rateLimits")) continue;
       try {
         const rec = JSON.parse(lines[i]);
-        const rl = rec.rate_limits || rec.payload?.rate_limits || rec.msg?.rate_limits;
-        const shaped = shapeUsage(rl, "codex session log", f.mtime);
+        const rl =
+          rec.rateLimits ||
+          rec.rate_limits ||
+          rec.payload?.rateLimits ||
+          rec.payload?.rate_limits ||
+          rec.msg?.rateLimits ||
+          rec.msg?.rate_limits;
+        const shaped = usageFromResult(rl, "codex session log", f.mtime);
         if (shaped) return shaped;
       } catch {}
     }
@@ -916,29 +1108,15 @@ const TOOLS = [
     },
     run: async ({ tasks }) => {
       if (!Array.isArray(tasks) || !tasks.length) throw new Error("tasks must be a non-empty array");
-      const started = [];
-      const claimed = new Set();
-      let queued = 0;
-      for (const spec of tasks) {
-        // Two Codex processes editing the same file is a merge nobody asked for.
-        // Overlap is decided on the declared `files`, so an undeclared file set
-        // is treated as touching everything.
-        const declared = (spec.files || "*").split(/[\s,]+/).filter(Boolean);
-        const overlaps = declared.includes("*") || declared.some((f) => claimed.has(f) || claimed.has("*"));
-        if (overlaps && started.length) {
-          queued++;
-          continue;
-        }
-        declared.forEach((f) => claimed.add(f));
-        started.push(startJob(spec));
-      }
-      const lines = started.map((j) => `${j.id}  ${j.task}`);
+      const created = tasks.map(enqueueJob);
+      const running = created.filter((j) => j.status === "running").length;
+      const queued = created.length - running;
+      const lines = created.map((j) => `${j.id}  [${j.status}]  ${j.task}`);
       return {
         ok: true,
         text:
-          `Started ${started.length} Codex ${started.length === 1 ? "build" : "builds"} in the background:\n` +
+          `Accepted ${created.length} Codex ${created.length === 1 ? "build" : "builds"}: ${running} running, ${queued} queued.\n` +
           lines.join("\n") +
-          (queued ? `\n\n${queued} task(s) not started: their files overlap with a running job. Send them again once these finish.` : "") +
           "\n\nCarry on with your own work. Call collect_codex_jobs when you want the results.",
       };
     },
@@ -975,6 +1153,7 @@ const TOOLS = [
     name: "set_project_context",
     peer: "Codex",
     local: true,
+    requiresWrites: true,
     description:
       "Write the shared grounding that every later delegation gets automatically: architecture, conventions, key " +
       "interfaces, what not to touch. Do this once when you start working on a repository, before the first handoff. " +
@@ -1039,6 +1218,10 @@ const TOOLS = [
 // ---------------------------------------------------------------------------
 
 async function handle(msg) {
+  if (msg.method === "notifications/cancelled") {
+    cancelRequest(msg.params?.requestId);
+    return null;
+  }
   // Notifications have no id and expect no reply.
   if (msg.id === undefined) return null;
 
@@ -1049,7 +1232,7 @@ async function handle(msg) {
         // on different release cadences and this avoids arguing about it.
         protocolVersion: msg.params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "agent-bridge", version: "0.6.0" },
+        serverInfo: { name: "agent-bridge", version: SERVER_VERSION },
       };
 
     case "ping":
@@ -1066,7 +1249,7 @@ async function handle(msg) {
           "what comes back, and still keep decisions and anything needing conversation context yourself."
         : "";
       return {
-        tools: TOOLS.map(({ name, description, inputSchema }) => ({
+        tools: TOOLS.filter((tool) => !REMOTE_MODE || REMOTE_WRITES || !tool.requiresWrites).map(({ name, description, inputSchema }) => ({
           name,
           description: description + conserve,
           inputSchema,
@@ -1077,6 +1260,12 @@ async function handle(msg) {
     case "tools/call": {
       const tool = TOOLS.find((t) => t.name === msg.params?.name);
       if (!tool) throw new Error(`unknown tool: ${msg.params?.name}`);
+      if (REMOTE_MODE && !REMOTE_WRITES && tool.requiresWrites) {
+        return {
+          content: [{ type: "text", text: `${tool.name} is disabled because remote writes are off.` }],
+          isError: true,
+        };
+      }
 
       if (DEPTH > 0) {
         return {
@@ -1176,9 +1365,9 @@ async function handle(msg) {
 //
 // stdio is the normal one: the host launches this file as a child process.
 // HTTP exists only so the Claude mobile app can reach it, because a phone
-// cannot launch a process on your laptop. Read the security notes in SETUP.md
-// before turning it on. In short, this endpoint runs commands on your machine,
-// so exposing it carelessly is exposing a shell.
+// cannot launch a process on your laptop. Read the remote-mode section in
+// README.md before turning it on. This endpoint can run commands on your machine,
+// so keep it on loopback behind a separately authenticated tunnel.
 // ---------------------------------------------------------------------------
 
 let notifyToolsChanged = () => {};
@@ -1193,7 +1382,7 @@ function startStdio() {
       return log("ignored unparseable line");
     }
     try {
-      const result = await handle(msg);
+      const result = await requestScope.run(msg.id, () => handle(msg));
       if (result === null) return;
       if (result.__error) return send({ jsonrpc: "2.0", id: msg.id, error: result.__error });
       send({ jsonrpc: "2.0", id: msg.id, result });
@@ -1245,7 +1434,7 @@ function startHttp() {
         return reply(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
       }
       try {
-        const result = await handle(msg);
+        const result = await requestScope.run(msg.id, () => handle(msg));
         if (result === null) return reply(202, {});
         if (result.__error) return reply(200, { jsonrpc: "2.0", id: msg.id, error: result.__error });
         reply(200, { jsonrpc: "2.0", id: msg.id, result });

@@ -44,13 +44,25 @@ const version = (bin) => {
 };
 
 /**
- * A flag counts as present if it appears in the CLI's own help output. Checking
- * help rather than exit codes matters because a real invocation can fail for a
- * dozen reasons that have nothing to do with the flag being tested.
+ * A flag counts as present if it appears in the CLI's own help output as a whole
+ * token. Checking help rather than exit codes matters because a real invocation
+ * can fail for a dozen reasons unrelated to the flag being tested.
+ *
+ * The boundary matters more than it looks. A plain substring test says `-a` is
+ * present in any help text containing "--allowedTools", and `-c` in any text
+ * mentioning "--config", so short flags would always pass and this whole script
+ * would report health it had not checked.
  */
-function helpHas(help, flag) {
-  return help.includes(flag);
+export function helpHas(help, flag) {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[\\s,\`'"([])${escaped}([\\s,=\\]).'"\`]|$)`, "m").test(help);
 }
+
+// Importing this file for its helpers must not run the probes.
+const RUN = process.argv[1] && process.argv[1].endsWith("doctor.mjs");
+if (!RUN) {
+  // eslint-disable-next-line no-empty
+} else {
 
 console.log("agent-bridge doctor\n");
 
@@ -139,3 +151,5 @@ console.log(
 );
 if (failures.length) console.log("\nEach failure names its workaround. CLAUDE.md lists which assumptions were never verified live.");
 process.exit(failures.length ? 1 : 0);
+
+}

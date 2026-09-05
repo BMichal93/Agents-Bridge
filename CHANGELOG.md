@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.6
+
+- Fix: `doctor` matched flags as substrings, so `-a` was "found" inside
+  `--allowedTools` and `--tools` inside `--allowedTools`. Short flags always
+  passed and the script reported health it had never checked. Matching is now
+  token-bounded and unit-tested.
+
 ## 0.9.5
 
 - `npm test` now synchronises versions first. Bumping `package.json` and running

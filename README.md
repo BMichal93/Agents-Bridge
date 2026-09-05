@@ -32,7 +32,7 @@ across related tasks.
 
 ### Claude Desktop
 
-1. Download `agent-bridge-0.9.5.mcpb` from Releases.
+1. Download `agent-bridge-0.9.6.mcpb` from Releases.
 2. Double-click it, or drag it into **Settings > Extensions**.
 3. Set **Default project folder** if requests will not always include an
    absolute `cwd`.
@@ -44,7 +44,7 @@ the local Codex CLI.
 ### VS Code, Claude Code and Codex CLI
 
 1. In VS Code, open **Extensions > ... > Install from VSIX**.
-2. Select `agent-bridge-0.9.5.vsix`.
+2. Select `agent-bridge-0.9.6.vsix`.
 3. Accept the one-time offer to enable the bridge for the Codex and Claude Code
    CLIs. You can run **Agent Bridge: Enable for Codex and Claude Code** later if
    you initially decline.

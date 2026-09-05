@@ -678,3 +678,17 @@ test("tool definitions stay within their context budget", async () => {
   assert.ok(size < 11000, `tool definitions are ${size} bytes; trim a description before raising this`);
   c.close();
 });
+
+test("doctor flag detection matches whole tokens, not substrings", async () => {
+  // A plain substring test finds "-a" inside "--allowedTools" and "--tools"
+  // inside "--allowedTools", so short flags would always pass and doctor would
+  // report health it had never checked. That failure is silent, which is the
+  // worst kind for a script whose whole job is catching silent breakage.
+  const { helpHas } = await import("../scripts/doctor.mjs");
+  assert.equal(helpHas("--allowedTools, --disallowedTools", "-a"), false);
+  assert.equal(helpHas("  -a, --approval <policy>", "-a"), true);
+  assert.equal(helpHas("  -c, --config <key=value>", "-c"), true);
+  assert.equal(helpHas("--config-file only", "-c"), false);
+  assert.equal(helpHas("  --tools <list>  Restrict available tools", "--tools"), true);
+  assert.equal(helpHas("only --allowedTools here", "--tools"), false);
+});

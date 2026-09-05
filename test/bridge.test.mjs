@@ -514,3 +514,39 @@ test("a verification process is killed when the MCP host closes", async () => {
   assert.equal(fs.existsSync(path.join(repo, "survived")), false);
   c.close();
 });
+
+test("space-separated files still serialise overlapping jobs", async () => {
+  // Regression: claimsFor split only on commas and newlines, so a natural
+  // space-separated list became one nonsense path that overlapped with nothing.
+  // Two jobs both touching b.ts would then have run at the same time.
+  const { env } = setup({ stdout: "built", sleepMs: 400 });
+  const c = client(env);
+  await c.init();
+
+  const first = c.text(await c.call("start_codex_jobs", { tasks: [{ task: "one", files: "a.ts b.ts" }] }));
+  assert.match(first, /1 running/);
+
+  const second = c.text(await c.call("start_codex_jobs", { tasks: [{ task: "two", files: "b.ts" }] }));
+  assert.match(second, /0 running, 1 queued/);
+
+  await c.call("collect_codex_jobs", {});
+  c.close();
+});
+
+test("a quoted path containing a space is kept as one claim", async () => {
+  const { env } = setup({ stdout: "built", sleepMs: 300 });
+  const c = client(env);
+  await c.init();
+  const started = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [
+        { task: "one", files: '"My Docs/a.ts"' },
+        { task: "two", files: "b.ts" },
+      ],
+    })
+  );
+  // Different files, so both should run rather than one waiting on the other.
+  assert.match(started, /2 running/);
+  await c.call("collect_codex_jobs", {});
+  c.close();
+});

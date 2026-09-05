@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "agent-bridge",
   "display_name": "Agent Bridge (Codex)",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Ask OpenAI Codex questions and delegate coding work to it from Claude.",
   "long_description": "Adds tools for asking Codex for a second opinion, delegating implementation, running independent Codex jobs, retaining project context and consulting Claude Code in the reverse direction. Local delegations use Codex's workspace-write sandbox. Remote HTTP delegations stay read-only unless remote writes are explicitly enabled. Results include the working-tree status after delegation and identify changes that already existed before the run. Requires the Codex CLI installed and signed in; ask_claude also requires Claude Code.",
   "author": {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.2
+
+- Fix: background-job file claims were split only on commas and newlines, so a
+  space-separated `files` list collapsed into one nonsense path that overlapped
+  with nothing. Two jobs naming the same file could then run at the same time,
+  which is what the scheduler exists to prevent. Splitting now also handles
+  whitespace, quoted paths stay intact, and the schema says so.
+
 ## 0.9.1
 
 - Fixed VS Code MCP registration to use the public positional constructor and

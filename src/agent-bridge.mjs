@@ -32,7 +32,7 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.1";
+const SERVER_VERSION = "0.9.2";
 
 // Questions come back in a minute or two. Real work takes longer, so the two
 // paths get separate budgets rather than one compromise value.
@@ -680,7 +680,17 @@ const runningClaims = new Map();
 
 function claimsFor(spec) {
   const base = spec.cwd || DEFAULT_CWD || process.cwd();
-  const declared = (spec.files || "*").split(/[\n,]+/).map((x) => x.trim()).filter(Boolean);
+  // Split on whitespace as well as commas and newlines. A caller writing
+  // `files: "src/a.ts src/b.ts"` is entirely natural, and splitting only on
+  // commas turned that into one nonsense path that overlapped with nothing, so
+  // a second job naming src/b.ts would run against it concurrently - the exact
+  // collision this scheduler exists to prevent. Over-splitting only costs some
+  // needless serialisation; under-splitting costs a corrupted file.
+  // A path that genuinely contains a space can be quoted.
+  const declared = (spec.files || "*")
+    .split(/"([^"]+)"|'([^']+)'|[\s,\n]+/)
+    .map((x) => (x || "").trim())
+    .filter(Boolean);
   if (!declared.length || declared.some((x) => x === "*" || /[*?\[\]]/.test(x))) return ["*"];
   return declared.map((file) => path.resolve(base, file));
 }
@@ -1023,7 +1033,13 @@ const TOOLS = [
             "you have decided on, not just the outcome. This is the design handoff: the more precisely you specify it, " +
             "the less of the result you have to read.",
         },
-        files: { type: "string", description: "Files or directories to work in, and any that are relevant but read-only." },
+        files: {
+          type: "string",
+          description:
+            "Files or directories to work in, and any that are relevant but read-only. Separate them with commas, " +
+            "newlines or spaces; quote a path that contains a space. This list is also what decides whether two " +
+            "background jobs may run at the same time, so declaring it accurately matters.",
+        },
         constraints: {
           type: "string",
           description: "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",
@@ -1077,7 +1093,13 @@ const TOOLS = [
             "you have decided on, not just the outcome. This is the design handoff: the more precisely you specify it, " +
             "the less of the result you have to read.",
         },
-        files: { type: "string", description: "Files or directories to work in, and any that are relevant but read-only." },
+        files: {
+          type: "string",
+          description:
+            "Files or directories to work in, and any that are relevant but read-only. Separate them with commas, " +
+            "newlines or spaces; quote a path that contains a space. This list is also what decides whether two " +
+            "background jobs may run at the same time, so declaring it accurately matters.",
+        },
         constraints: {
           type: "string",
           description: "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",

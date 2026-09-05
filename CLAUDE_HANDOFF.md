@@ -71,6 +71,23 @@ three manual smoke tests on a machine with authenticated CLIs:
 3. From Codex, invoke `ask_claude` and confirm Claude can inspect the repository
    but cannot edit or call MCP tools.
 
+## Claude review of 0.9.1
+
+Verified independently rather than accepted: the `--tools` versus `--allowedTools`
+distinction is real (`--allowedTools` only skips permission prompts and appends to
+the default tool set, so the previous `ask_claude` was not read-only), and
+`McpStdioServerDefinition` really does take positional arguments. Note that the
+official VS Code MCP guide shows an object-literal example, which is where the
+original error came from; every type reference disagrees with it.
+
+One further defect found and fixed in 0.9.2: `claimsFor` split `files` only on
+commas and newlines, so `files: "a.ts b.ts"` became a single nonsense path that
+overlapped with nothing and let a second job touching `b.ts` run concurrently.
+
+Not performed: the live authenticated smoke tests. No Codex or Claude CLI is
+installed in this environment, so everything below the stub layer remains
+unverified against a real provider.
+
 ## Remaining limits
 
 - Direct blocking delegations are not scheduled against each other. Use

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5
+
+- `npm test` now synchronises versions first. Bumping `package.json` and running
+  the tests used to fail until you also ran a build, because the server's version
+  was only synchronised at build time and the handshake test compares the two.
+
 ## 0.9.4
 
 - `npm run budget` measures what the pack costs and saves, counting design

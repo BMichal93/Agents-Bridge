@@ -189,6 +189,17 @@ function buildVsix() {
 }
 
 const what = process.argv[2];
+
+// --sync-only exists because of a real trap: bump package.json, run the tests,
+// and they fail, because the server still reports the old version and the
+// handshake test compares the two. The version was only synchronised at build
+// time, which is after the point where you want to know. `npm test` now runs
+// this first, so the order you work in stops mattering.
+if (what === "--sync-only") {
+  syncVersions();
+  process.exit(0);
+}
+
 console.log(`agent-bridge ${VERSION}`);
 syncVersions();
 if (!what || what === "mcpb") buildMcpb();

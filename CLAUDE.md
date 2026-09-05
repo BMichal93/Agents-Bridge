@@ -26,8 +26,9 @@ npm run build      both bundles into dist/
 npm run build mcpb just the Claude Desktop bundle
 ```
 
-Bumping a version means editing `package.json` only. The build syncs it into both
-manifests and into the server's `serverInfo`.
+Bumping a version means editing `package.json` only. `npm test` and `npm run
+build` both synchronise it into the manifests, the docs' download filenames and
+the server's `SERVER_VERSION`, so the order you run them in does not matter.
 
 ## Things that will bite you
 

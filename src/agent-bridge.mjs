@@ -32,7 +32,7 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.4";
+const SERVER_VERSION = "0.9.5";
 
 // Questions come back in a minute or two. Real work takes longer, so the two
 // paths get separate budgets rather than one compromise value.

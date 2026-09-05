@@ -24,7 +24,82 @@ const cp = require("child_process");
 const SERVER_NAME = "agent-bridge";
 const OFFERED_KEY = "agentBridge.offeredCliSetup";
 
-const serverPath = (context) => path.join(context.extensionPath, "server", "agent-bridge.mjs");
+const STATE_DIR = path.join(os.homedir(), ".agent-bridge");
+
+/**
+ * Where the server runs from.
+ *
+ * VS Code installs extensions into a version-stamped folder and deletes the old
+ * one on update, so `.../mbudziszewski.agent-bridge-0.7.0/server/...` is a path
+ * that breaks the next time this extension updates. VS Code itself is fine with
+ * that because it asks us for the path each time it starts the server. The Codex
+ * and Claude Code CLIs are not: they store whatever path they were given, so
+ * pointing them at the extension folder would leave two silently broken configs
+ * after every update.
+ *
+ * So the server is copied to a stable location on each activation, and that is
+ * the path everything gets told about. Copying every time also means an extension
+ * update actually updates the copy the CLIs use.
+ */
+function serverPath(context) {
+  const bundled = path.join(context.extensionPath, "server", "agent-bridge.mjs");
+  const stable = path.join(STATE_DIR, "agent-bridge.mjs");
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.copyFileSync(bundled, stable);
+    return stable;
+  } catch {
+    // If the copy fails, running from the extension folder is better than not
+    // running at all. VS Code will still work; the CLIs may break on update.
+    return bundled;
+  }
+}
+
+/**
+ * The delegation policy, installed as a Claude Code skill.
+ *
+ * The tools alone do not produce sensible delegation. A model that can see
+ * `delegate_to_codex` still has to decide when reaching for it beats doing the
+ * work, and without something written down it mostly does everything itself. As a
+ * skill rather than a CLAUDE.md block, it loads when a task looks delegable
+ * instead of costing context every session.
+ */
+const SKILL = `---
+name: delegating-to-codex
+description: Decide what to hand to OpenAI Codex and what to keep. Use when the agent-bridge tools (ask_codex, delegate_to_codex) are available and a task might be worth delegating - wide mechanical refactors, boilerplate, test scaffolding - or when the user asks to push work to Codex or save Claude usage.
+---
+
+## Working with Codex
+
+**Delegate when** the work is mechanical and well specified, separable from what
+you are doing, you can write it down completely, and - most important - the result
+is cheap to check relative to the work. Delegating saves usage only when a lot of
+work returns as something small you can verify: a passing test command, a diff
+stat you can scan. Work that returns a large diff you then read line by line costs
+about what writing it would have, plus the round trip.
+
+Put a concrete command in \`acceptance\` and tell Codex to run it and report the
+outcome, so you get a verdict instead of a diff to audit.
+
+**Ask Codex** when you are genuinely uncertain about a design decision, stuck on a
+bug after a real attempt, or it plausibly knows a library better than you.
+
+**Keep it yourself** when it needs conversation context that would be lossy to
+write out, when it is an architecture or product decision, when it is small enough
+that you would finish it in the time a round trip takes, or when you are already
+mid-change.
+
+**After every delegation** read the \`git diff --stat\` that comes back. If it is
+empty, nothing was written whatever the summary said. Read the actual diff of
+anything you build on. Do not loop more than twice on one task.
+
+**Say what you are doing** before a delegation: one line on what you are handing
+off and what you are keeping, so the user can stop you.
+
+**Do not delegate by default.** It is worth it less often than it sounds.
+`;
+
+const skillPath = () => path.join(os.homedir(), ".claude", "skills", "delegating-to-codex", "SKILL.md");
 
 /** Config values, resolved fresh each time so changing a setting takes effect. */
 function env() {
@@ -69,6 +144,20 @@ function applyToClis(context, enable) {
     // Removing something that was never there is a success from our side.
     if (r.ok || (!enable && /not found|no mcp server/i.test(r.out))) done.push(host.label);
     else skipped.push(`${host.label} (${r.out.split("\n").slice(-1)[0].slice(0, 80)})`);
+
+    // Claude Code gets the delegation policy too. Without it the tools are
+    // present but nothing tells Claude when to reach for them, which in practice
+    // means it rarely does.
+    if (host.label === "Claude Code") {
+      try {
+        if (enable) {
+          fs.mkdirSync(path.dirname(skillPath()), { recursive: true });
+          fs.writeFileSync(skillPath(), SKILL);
+        } else if (fs.existsSync(skillPath())) {
+          fs.rmSync(path.dirname(skillPath()), { recursive: true, force: true });
+        }
+      } catch {}
+    }
   }
 
   const verb = enable ? "Enabled for" : "Removed from";

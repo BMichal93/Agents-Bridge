@@ -465,7 +465,7 @@ function usageFromAppServer() {
       }
     });
     child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.7.0" } } }) +
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.7.1" } } }) +
         "\n" +
         JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) +
         "\n"

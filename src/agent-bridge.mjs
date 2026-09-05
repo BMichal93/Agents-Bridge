@@ -308,7 +308,7 @@ const askFrame = (question) =>
 // A delegated task is a handoff to a process with no memory of your conversation.
 // The sections exist to force the caller to write down what it would otherwise
 // assume: which files, what not to touch, and how anyone can tell it worked.
-const delegateFrame = ({ task, files, constraints, acceptance }) =>
+const delegateFrame = ({ task, files, constraints, acceptance, verify: verifyCommand }) =>
   [
     "You are an implementation agent working on a task delegated by another AI agent.",
     "You have no access to the conversation this task came from, so everything you need is below.",
@@ -318,6 +318,7 @@ const delegateFrame = ({ task, files, constraints, acceptance }) =>
     files ? `\n## Relevant files\n${files}` : "",
     constraints ? `\n## Constraints\n${constraints}` : "",
     acceptance ? `\n## Done when\n${acceptance}` : "",
+    verifyCommand ? `\n## Verification\nWhen you are finished, \`${verifyCommand}\` will be run against your work. Make it pass.` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -362,7 +363,7 @@ async function askCodex({ question, cwd, model, effort }) {
   return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS);
 }
 
-async function delegateToCodex({ task, files, constraints, acceptance, cwd, model, effort, allow_writes }) {
+async function delegateToCodex({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes }) {
   // Over HTTP the default is read-only. A remote caller that can write files on
   // your machine is a different kind of thing from a local one, so it has to be
   // turned on deliberately rather than inherited from the local behaviour.
@@ -372,11 +373,16 @@ async function delegateToCodex({ task, files, constraints, acceptance, cwd, mode
   // Ask git what changed even when the run failed: a delegation that died partway
   // through still leaves edits behind, and that is exactly when you want to know.
   const diff = await gitSummary(cwd);
-  const text = diff
-    ? `${r.text}\n\n--- git diff --stat (what actually changed on disk) ---\n${diff}\n` +
-      "Review this before you build on it. If it is empty, nothing was written."
-    : `${r.text}\n\n(no git diff available: not a git repository, or git is not on PATH)`;
-  return { ...r, text };
+  const verify = verifyCommand ? await runVerify(verifyCommand, cwd) : null;
+
+  // Verdict first, then what changed, then the builder's own words last. The
+  // caller should be able to stop reading after two lines when it passed.
+  const parts = [];
+  if (verify) parts.push(verify.text);
+  parts.push(diff ? `changed:\n${diff}` : "(no git diff available: not a git repository, or git is not on PATH)");
+  if (!verify) parts.push("No verify command was given, so nothing here confirms the change works. Read the diff.");
+  parts.push(`codex said:\n${r.text}`);
+  return { ...r, ok: r.ok && (!verify || !verify.ran || verify.ok), text: parts.join("\n\n") };
 }
 
 async function askClaude({ question, cwd, model, effort }) {
@@ -386,6 +392,88 @@ async function askClaude({ question, cwd, model, effort }) {
   const chosen = resolveEffort("claude", effort);
   const args = ["-p", "--allowedTools", "Read,Grep,Glob", ...modelArgs("--model", model, chosen.model || CLAUDE_MODEL)];
   return runAgent(CLAUDE_BIN, args, askFrame(question), cwd, ASK_TIMEOUT_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+//
+// The whole architect/builder split only saves anything if the architect does
+// not have to read the builder's diff line by line. So the bridge runs a check
+// command itself and reports a verdict. "14 tests pass" costs the caller a line;
+// a 600-line diff costs it a review.
+//
+// This runs a command the calling model supplied, which is a real step beyond
+// spawning a fixed CLI. The allowlist is the mitigation: only the first token is
+// matched, and only against commands you listed. Default covers the usual test
+// runners and nothing else.
+// ---------------------------------------------------------------------------
+
+const VERIFY_ALLOWLIST = (process.env.AGENT_BRIDGE_VERIFY_ALLOW || "npm,npx,pnpm,yarn,dotnet,pytest,python,go,cargo,make,mvn,gradle,jest,vitest,tsc,eslint")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+function runVerify(command, cwd) {
+  return new Promise((resolve) => {
+    const parts = command.trim().split(/\s+/);
+    const head = path.basename(parts[0] || "").replace(/\.(exe|cmd|bat)$/i, "");
+    if (!VERIFY_ALLOWLIST.includes(head)) {
+      return resolve({ ran: false, text: `verify skipped: "${head}" is not in the allowlist (${VERIFY_ALLOWLIST.join(", ")})` });
+    }
+    const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : parts[0];
+    // The command came from a model, so on Windows it must not be handed to
+    // cmd.exe as one string where &, | and > would be operators. Each token goes
+    // across separately, and the head is already allowlisted.
+    const argv = IS_WINDOWS ? ["/d", "/s", "/c", ...parts] : parts.slice(1);
+    const child = spawn(file, argv, { cwd: cwd || DEFAULT_CWD || process.cwd(), stdio: ["ignore", "pipe", "pipe"], detached: !IS_WINDOWS });
+    let out = "";
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(v);
+    };
+    const t = setTimeout(() => {
+      killTree(child);
+      finish({ ran: true, ok: false, text: `verify \`${command}\` timed out after 10 minutes` });
+    }, 600_000);
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("error", (e) => finish({ ran: false, text: `verify could not start: ${e.message}` }));
+    child.on("close", (code) => {
+      const tail = out.trim().split("\n").slice(-15).join("\n");
+      finish({
+        ran: true,
+        ok: code === 0,
+        text: code === 0 ? `verify \`${command}\` PASSED` : `verify \`${command}\` FAILED (exit ${code})\n${tail}`,
+      });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs
+//
+// Codex is slower than Claude, which is the reason to run it in the background
+// rather than a reason not to use it. Start work, keep planning, collect later.
+// ---------------------------------------------------------------------------
+
+const jobs = new Map();
+let jobCounter = 0;
+
+function startJob(spec) {
+  const id = `job-${++jobCounter}`;
+  const job = { id, task: spec.task.slice(0, 80), status: "running", startedAt: Date.now() };
+  jobs.set(id, job);
+  job.promise = (async () => {
+    const r = await delegateToCodex(spec);
+    job.status = r.ok ? "done" : "failed";
+    job.seconds = Math.round((Date.now() - job.startedAt) / 1000);
+    job.text = r.text;
+    return job;
+  })();
+  return job;
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +553,7 @@ function usageFromAppServer() {
       }
     });
     child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.7.1" } } }) +
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: "0.8.0" } } }) +
         "\n" +
         JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) +
         "\n"
@@ -623,34 +711,34 @@ const TOOLS = [
     name: "delegate_to_codex",
     peer: "Codex",
     description:
-      "Hand a self-contained unit of work to OpenAI Codex, which will edit files in the workspace and report back. " +
-      "Use for work that is well specified and separable from what you are doing: mechanical refactors across many " +
-      "files, boilerplate, test scaffolding, applying a pattern you have already settled on. Do not use for design " +
-      "decisions, for anything that depends on conversation context you cannot write down, or for a change you are " +
-      "in the middle of yourself. A delegated run takes several minutes and costs a full agent session, so it has to " +
-      "save more work than it costs. The result includes a git diff of what actually changed; check it rather than " +
-      "trusting the summary.",
+      "Hand a specified piece of implementation work to OpenAI Codex, which edits files in the workspace and reports " +
+      "back. This is the builder half of the split: you decide the design, Codex writes the code. Use it for anything " +
+      "you can specify completely, which is most implementation once the approach is settled. Keep design decisions, " +
+      "anything needing conversation context, and review for yourself. Give a `verify` command whenever the repo has " +
+      "one: the result comes back verdict first, so a passing check costs you one line instead of a diff to read. " +
+      "Blocking, so use start_codex_jobs instead when you have independent pieces or want to keep planning.",
     inputSchema: {
       type: "object",
       properties: {
         task: {
           type: "string",
           description:
-            "What to do, written for someone who has never seen your conversation. State the goal and the approach, " +
-            "not just the outcome.",
+            "What to build, written for someone who has never seen your conversation. State the goal and the approach " +
+            "you have decided on, not just the outcome. This is the design handoff: the more precisely you specify it, " +
+            "the less of the result you have to read.",
         },
-        files: {
-          type: "string",
-          description: "Files or directories to work in, and any that are relevant but should be read only.",
-        },
+        files: { type: "string", description: "Files or directories to work in, and any that are relevant but read-only." },
         constraints: {
           type: "string",
-          description:
-            "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",
+          description: "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",
         },
-        acceptance: {
+        acceptance: { type: "string", description: "How to tell it is done, in words." },
+        verify: {
           type: "string",
-          description: "How to tell the task is done. A command that should pass, or the behaviour that should hold.",
+          description:
+            "A command that proves the work: `npm test`, `dotnet build`, `pytest tests/auth`. The bridge runs it after " +
+            "Codex finishes and reports pass or fail. Give one whenever the repository has one. This is what lets you " +
+            "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
         },
         cwd: CWD_PROP,
         effort: EFFORT_PROP,
@@ -659,6 +747,111 @@ const TOOLS = [
       required: ["task"],
     },
     run: delegateToCodex,
+  },
+  {
+    name: "start_codex_jobs",
+    peer: "Codex",
+    local: true,
+    description:
+      "Start one or more Codex builds in the background and return immediately with job ids. Use this whenever you have " +
+      "more than one independent piece, or want to carry on designing while Codex builds. Tasks whose `files` do not " +
+      "overlap run at the same time; overlapping ones are queued, because nothing here locks files. Collect the results " +
+      "with collect_codex_jobs when you are ready. This is the tool that makes Codex being slower than you stop " +
+      "mattering: its time runs alongside yours instead of in front of it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          description: "The pieces to build. Each is a complete handoff on its own.",
+          items: {
+            type: "object",
+            properties: {
+        task: {
+          type: "string",
+          description:
+            "What to build, written for someone who has never seen your conversation. State the goal and the approach " +
+            "you have decided on, not just the outcome. This is the design handoff: the more precisely you specify it, " +
+            "the less of the result you have to read.",
+        },
+        files: { type: "string", description: "Files or directories to work in, and any that are relevant but read-only." },
+        constraints: {
+          type: "string",
+          description: "What not to do: files to leave alone, patterns to follow, libraries to avoid, style rules that matter here.",
+        },
+        acceptance: { type: "string", description: "How to tell it is done, in words." },
+        verify: {
+          type: "string",
+          description:
+            "A command that proves the work: `npm test`, `dotnet build`, `pytest tests/auth`. The bridge runs it after " +
+            "Codex finishes and reports pass or fail. Give one whenever the repository has one. This is what lets you " +
+            "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
+        },
+              cwd: CWD_PROP,
+              effort: EFFORT_PROP,
+            },
+            required: ["task"],
+          },
+        },
+      },
+      required: ["tasks"],
+    },
+    run: async ({ tasks }) => {
+      if (!Array.isArray(tasks) || !tasks.length) throw new Error("tasks must be a non-empty array");
+      const started = [];
+      const claimed = new Set();
+      let queued = 0;
+      for (const spec of tasks) {
+        // Two Codex processes editing the same file is a merge nobody asked for.
+        // Overlap is decided on the declared `files`, so an undeclared file set
+        // is treated as touching everything.
+        const declared = (spec.files || "*").split(/[\s,]+/).filter(Boolean);
+        const overlaps = declared.includes("*") || declared.some((f) => claimed.has(f) || claimed.has("*"));
+        if (overlaps && started.length) {
+          queued++;
+          continue;
+        }
+        declared.forEach((f) => claimed.add(f));
+        started.push(startJob(spec));
+      }
+      const lines = started.map((j) => `${j.id}  ${j.task}`);
+      return {
+        ok: true,
+        text:
+          `Started ${started.length} Codex ${started.length === 1 ? "build" : "builds"} in the background:\n` +
+          lines.join("\n") +
+          (queued ? `\n\n${queued} task(s) not started: their files overlap with a running job. Send them again once these finish.` : "") +
+          "\n\nCarry on with your own work. Call collect_codex_jobs when you want the results.",
+      };
+    },
+  },
+  {
+    name: "collect_codex_jobs",
+    peer: "Codex",
+    local: true,
+    description:
+      "Wait for background Codex builds started with start_codex_jobs and return their results. Call it when you have " +
+      "finished the planning or code you were doing alongside them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Which jobs to collect. Omit to collect every job that is still outstanding.",
+        },
+      },
+    },
+    run: async ({ ids }) => {
+      const wanted = ids?.length ? ids.map((id) => jobs.get(id)).filter(Boolean) : [...jobs.values()].filter((j) => !j.collected);
+      if (!wanted.length) return { ok: true, text: "No outstanding Codex jobs." };
+      const settled = await Promise.all(wanted.map((j) => j.promise));
+      settled.forEach((j) => (j.collected = true));
+      return {
+        ok: settled.every((j) => j.status === "done"),
+        text: settled.map((j) => `### ${j.id} (${j.status}, ${j.seconds}s) - ${j.task}\n${j.text}`).join("\n\n"),
+      };
+    },
   },
   {
     name: "ask_claude",
@@ -743,13 +936,13 @@ async function handle(msg) {
       }
 
       const args = msg.params?.arguments || {};
-      const required = tool.inputSchema.required[0];
-      if (!args[required]) throw new Error(`${required} is required`);
+      const required = tool.inputSchema.required?.[0];
+      if (required && !args[required]) throw new Error(`${required} is required`);
 
       // If this peer has already failed twice, stop trying. Whatever the cause,
       // it is not going to fix itself mid-session, and each attempt costs the
       // caller a wait plus a wasted message.
-      if (failures[tool.peer] >= MAX_FAILURES) {
+      if (!tool.local && failures[tool.peer] >= MAX_FAILURES) {
         return {
           content: [
             {
@@ -770,10 +963,9 @@ async function handle(msg) {
       const r = await tool.run(args);
       const seconds = Math.round((Date.now() - startedAt) / 1000);
 
-      if (r.ok) {
-        failures[tool.peer] = 0;
-      } else {
-        failures[tool.peer] += 1;
+      if (!tool.local) {
+        if (r.ok) failures[tool.peer] = 0;
+        else failures[tool.peer] += 1;
       }
       log(`${tool.name} ${r.ok ? "ok" : "FAILED"} in ${seconds}s, ${r.text.length} chars`);
 
@@ -787,7 +979,7 @@ async function handle(msg) {
 
       // The Claude desktop app gives an extension no way to draw UI, so the tool
       // result is the only surface there. One compact line, not a dashboard.
-      const usage = tool.peer === "Codex" ? codexUsageCached() : null;
+      const usage = tool.peer === "Codex" && !tool.local ? codexUsageCached() : null;
       const modelShown = args.model || chosen.model || "CLI default";
       const footer = [
         tool.name,

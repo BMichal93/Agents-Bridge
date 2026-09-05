@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- Reframed around an architect/builder split: Claude designs, Codex implements.
+  Delegating implementation is now the default rather than the exception.
+- `verify` command on delegations. The bridge runs it after Codex finishes and
+  reports the verdict first, so a passing check costs one line instead of a diff
+  to read. Allowlisted by first token.
+- `start_codex_jobs` and `collect_codex_jobs`: background, parallel builds.
+  Non-overlapping `files` run at once; overlapping ones are held back.
+- Delegations with no `verify` say so rather than looking confirmed.
+
 ## 0.7.0
 
 - Result footer and VS Code status bar showing effort tier, model, duration and

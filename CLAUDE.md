@@ -60,6 +60,14 @@ change. Conserve mode works entirely by rewriting them.
 POSIX. Killing only the direct child leaves an agent editing files with nobody
 watching. There is a test for this; keep it passing.
 
+## The verify path runs a model-supplied command
+
+`delegate_to_codex` and the job tools accept a `verify` command and the bridge
+runs it. That is a step beyond spawning a fixed CLI, so: only the first token is
+matched, only against `AGENT_BRIDGE_VERIFY_ALLOW`, and on Windows the tokens go
+to cmd.exe separately so `&`, `|` and `>` cannot act as operators. If you widen
+this, keep all three properties.
+
 ## Testing philosophy
 
 The tests drive the real server over real stdio with stub CLIs, rather than unit

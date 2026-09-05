@@ -25,7 +25,7 @@ test("handshake and tool listing", async () => {
   const list = await c.send("tools/list", {});
   assert.deepEqual(
     list.result.tools.map((t) => t.name),
-    ["ask_codex", "delegate_to_codex", "ask_claude"]
+    ["ask_codex", "delegate_to_codex", "start_codex_jobs", "collect_codex_jobs", "ask_claude"]
   );
   c.close();
 });
@@ -244,4 +244,76 @@ test("HTTP mode rejects a wrong secret and serves the right one", async () => {
   assert.ok(!/workspace-write/.test(JSON.stringify(body)), "remote delegation should be read-only by default");
 
   srv.kill();
+});
+
+test("a verify command turns a delegation into a verdict", async () => {
+  const { env } = setup({ stdout: "I changed some files." });
+  const c = client(env);
+  await c.init();
+  // `node` is not on the allowlist, so this also proves the allowlist bites.
+  const blocked = c.text(await c.call("delegate_to_codex", { task: "t", verify: "node -e 1" }));
+  assert.match(blocked, /not in the allowlist/);
+
+  c.close();
+
+  const c2 = client({ ...env, AGENT_BRIDGE_VERIFY_ALLOW: "node" });
+  await c2.init();
+  const passed = c2.text(await c2.call("delegate_to_codex", { task: "t", verify: "node --version" }));
+  assert.match(passed, /verify `node --version` PASSED/);
+  // The verdict must lead and Codex's prose must trail.
+  assert.ok(passed.indexOf("verify") < passed.indexOf("codex said:"), "verdict should come first");
+  c2.close();
+});
+
+test("missing verify is called out rather than passing silently", async () => {
+  const { env } = setup({ stdout: "done" });
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t" }));
+  assert.match(text, /No verify command was given/);
+  c.close();
+});
+
+test("background jobs run in parallel and are collected together", async () => {
+  const { env } = setup({ stdout: "built it", sleepMs: 1500 });
+  const c = client(env);
+  await c.init();
+
+  const started = Date.now();
+  const start = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [
+        { task: "build a", files: "a.ts" },
+        { task: "build b", files: "b.ts" },
+        { task: "build c", files: "c.ts" },
+      ],
+    })
+  );
+  assert.match(start, /Started 3 Codex builds/);
+  // Starting must return immediately; that is the entire point.
+  assert.ok(Date.now() - started < 1000, "start_codex_jobs blocked");
+
+  const collected = c.text(await c.call("collect_codex_jobs", {}));
+  assert.match(collected, /job-1/);
+  assert.match(collected, /job-3/);
+  // Three 1.5s builds in parallel finish well inside three serial ones.
+  assert.ok(Date.now() - started < 4000, `took ${Date.now() - started}ms, looks serial`);
+  c.close();
+});
+
+test("jobs touching the same files are not started at once", async () => {
+  const { env } = setup({ stdout: "built it", sleepMs: 300 });
+  const c = client(env);
+  await c.init();
+  const start = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [
+        { task: "one", files: "shared.ts" },
+        { task: "two", files: "shared.ts" },
+      ],
+    })
+  );
+  assert.match(start, /Started 1 Codex build/);
+  assert.match(start, /files overlap/);
+  c.close();
 });

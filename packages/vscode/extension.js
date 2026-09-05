@@ -66,37 +66,69 @@ function serverPath(context) {
  */
 const SKILL = `---
 name: delegating-to-codex
-description: Decide what to hand to OpenAI Codex and what to keep. Use when the agent-bridge tools (ask_codex, delegate_to_codex) are available and a task might be worth delegating - wide mechanical refactors, boilerplate, test scaffolding - or when the user asks to push work to Codex or save Claude usage.
+description: How to split work with OpenAI Codex - you design, Codex builds. Use whenever the agent-bridge tools (delegate_to_codex, start_codex_jobs) are available and there is implementation work to do, or when the user asks to push work to Codex or save Claude usage.
 ---
 
-## Working with Codex
+## The split
 
-**Delegate when** the work is mechanical and well specified, separable from what
-you are doing, you can write it down completely, and - most important - the result
-is cheap to check relative to the work. Delegating saves usage only when a lot of
-work returns as something small you can verify: a passing test command, a diff
-stat you can scan. Work that returns a large diff you then read line by line costs
-about what writing it would have, plus the round trip.
+You are the architect. Codex is the builder. Once you know what should be built
+and how, writing it out is Codex's job, not yours.
 
-Put a concrete command in \`acceptance\` and tell Codex to run it and report the
-outcome, so you get a verdict instead of a diff to audit.
+**Yours:** understanding the problem, reading the code that matters, choosing the
+approach, deciding the interfaces and data shapes, reviewing what comes back, and
+anything that needs the conversation you are in.
 
-**Ask Codex** when you are genuinely uncertain about a design decision, stuck on a
-bug after a real attempt, or it plausibly knows a library better than you.
+**Codex's:** turning a settled design into code. Implementations, boilerplate,
+tests, applying a decided pattern across files, migrations, wiring.
 
-**Keep it yourself** when it needs conversation context that would be lossy to
-write out, when it is an architecture or product decision, when it is small enough
-that you would finish it in the time a round trip takes, or when you are already
-mid-change.
+Default to delegating implementation. When you catch yourself about to write a
+file whose shape you have already decided, that is a handoff you are missing.
 
-**After every delegation** read the \`git diff --stat\` that comes back. If it is
-empty, nothing was written whatever the summary said. Read the actual diff of
-anything you build on. Do not loop more than twice on one task.
+## Specify well enough that you do not have to read the result
 
-**Say what you are doing** before a delegation: one line on what you are handing
-off and what you are keeping, so the user can stop you.
+The saving is not in Codex writing the code. It is in you accepting the work on a
+verdict instead of a diff. So every handoff carries:
 
-**Do not delegate by default.** It is worth it less often than it sounds.
+- **task** - the goal and the approach you chose, written for someone who has not
+  seen this conversation
+- **files** - what to touch, and what is relevant but read-only
+- **constraints** - patterns to follow, libraries to avoid, what to leave alone
+- **verify** - a command that proves it: \`npm test\`, \`dotnet build\`,
+  \`pytest tests/auth\`. Give one whenever the repo has one. The bridge runs it and
+  reports pass or fail, so a passing build costs you one line.
+
+A handoff you cannot write down is a design you have not finished. Finish it
+first; that part is your job anyway.
+
+## Work in parallel
+
+Use \`start_codex_jobs\` when there is more than one independent piece, or when you
+want to keep designing while building happens. It returns immediately with job
+ids; call \`collect_codex_jobs\` when you reach a point where you need the results.
+Codex is slower than you, which is a reason to run it alongside your work rather
+than in front of it. Tasks with non-overlapping \`files\` run at the same time.
+
+Use \`delegate_to_codex\` when you need the one thing before you can continue.
+
+## Keep it yourself when
+
+- The design is not settled. Delegating an unfinished design produces code you
+  then have to read closely, which costs more than writing it.
+- It is a two-line change. The handoff costs more than the edit.
+- It needs conversation context that would be lossy to write out.
+- You are already mid-change in those files.
+
+## After every handoff
+
+Read the verdict first. If verify passed and the diff stat looks like the change
+you asked for, move on. If there was no verify command, read the diff, and next
+time give one. An empty diff stat means nothing was written, whatever the summary
+says. Do not loop more than twice on one task; rewrite the spec or do it yourself.
+
+## Tell the user
+
+One line before delegating: what you are handing off, what you are keeping. They
+should be able to stop you.
 `;
 
 const skillPath = () => path.join(os.homedir(), ".claude", "skills", "delegating-to-codex", "SKILL.md");

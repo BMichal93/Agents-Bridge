@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.8
+
+- `ask_claude` now separates the flags that carry its read-only guarantee from
+  the ones that are only hygiene. A Claude Code that rejects
+  `--no-session-persistence` is retried without it and the substitution is
+  reported; a Claude Code that rejects `--restricted` fails loudly and is never
+  retried unrestricted. Previously either rejection failed the call outright, and
+  two of them opened the circuit breaker and disabled the tool for the session.
+
 ## 0.9.7
 
 - Harden `ask_codex` with ephemeral sessions plus ignored user config/rules, and

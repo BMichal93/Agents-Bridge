@@ -972,3 +972,55 @@ test("doctor flag detection matches whole tokens, not substrings", async () => {
   assert.equal(helpHas("  --tools <list>  Restrict available tools", "--tools"), true);
   assert.equal(helpHas("only --allowedTools here", "--tools"), false);
 });
+
+test("a rejected hygiene flag is retried without it, not fatal", async () => {
+  // --no-session-persistence has been removed from Claude Code at least once and
+  // shipped as a no-op in another release. It contributes nothing to the
+  // read-only guarantee, so losing it must not cost the tool: two failures would
+  // otherwise open the circuit breaker and disable ask_claude for the session.
+  const { home, env } = setup();
+  const js = path.join(home, "bin", "claude.stub.mjs");
+  fs.writeFileSync(
+    js,
+    `const args = process.argv.slice(2);
+if (args.includes("--no-session-persistence")) {
+  console.error("error: unknown option '--no-session-persistence'");
+  process.exit(1);
+}
+process.stdin.resume();
+process.stdin.on("end", () => { console.log("answered without the flag"); });
+`
+  );
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("ask_claude", { question: "q" }));
+  assert.match(text, /does not accept --no-session-persistence/);
+  assert.match(text, /answered without the flag/);
+  assert.match(text, /read-only flags were unaffected/);
+  c.close();
+});
+
+test("a rejected read-only flag fails loudly and is not retried", async () => {
+  // --restricted is part of the guarantee. Retrying without it would leave
+  // ask_claude looking read-only while it was not, which is the precise failure
+  // the --tools correction existed to remove.
+  const { home, env } = setup();
+  const js = path.join(home, "bin", "claude.stub.mjs");
+  fs.writeFileSync(
+    js,
+    `const args = process.argv.slice(2);
+if (args.includes("--restricted")) {
+  console.error("error: unknown option '--restricted'");
+  process.exit(1);
+}
+console.log("RAN WITHOUT RESTRICTED");
+`
+  );
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("ask_claude", { question: "q" }));
+  assert.match(text, /part of ask_claude's read-only guarantee/);
+  assert.match(text, /2\.1\.248/);
+  assert.ok(!text.includes("RAN WITHOUT RESTRICTED"), "must not fall back to an unrestricted run");
+  c.close();
+});

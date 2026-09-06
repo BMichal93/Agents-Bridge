@@ -2,7 +2,7 @@
   "name": "agent-bridge",
   "displayName": "Agent Bridge: delegate to Codex",
   "description": "Let Claude and Copilot hand coding work to OpenAI Codex, and ask it for second opinions. Install and it works until you disable it.",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "publisher": "mbudziszewski",
   "license": "MIT",
   "engines": {

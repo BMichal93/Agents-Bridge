@@ -32,7 +32,7 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.7";
+const SERVER_VERSION = "0.9.8";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -677,6 +677,29 @@ async function delegateToCodex(spec) {
   return withLaneLock(spec.lane, spec.cwd, () => delegateToCodexUnlocked(spec));
 }
 
+// Two kinds of flag, and the difference decides what happens when one is
+// rejected.
+//
+// Required flags carry the read-only guarantee. If the installed Claude Code
+// does not know one of them, the guarantee cannot be established, and quietly
+// running anyway would leave ask_claude looking read-only while it is not.
+// That is the exact failure the --tools fix existed to remove, so these fail
+// loudly instead.
+//
+// Optional flags are hygiene. --no-session-persistence only stops a session
+// file being written; --restricted and --bare already do the isolation work.
+// It is also the flag most likely to be rejected: it has been removed from the
+// CLI at least once and shipped as a no-op in at least one release. Losing a
+// tidy-up is not worth losing the tool for the rest of the session, so a
+// rejection of one of these is retried without it and reported.
+const CLAUDE_OPTIONAL_FLAGS = new Set(["--no-session-persistence"]);
+
+/** Pull the flag name out of a CLI's complaint, whatever wording it used. */
+function rejectedFlag(text = "") {
+  const m = text.match(/(?:unknown|unrecognized|unexpected)\s+(?:option|flag|argument)[:\s]+'?(--?[A-Za-z0-9][-A-Za-z0-9]*)'?/i);
+  return m ? m[1] : null;
+}
+
 async function askClaude({ question, cwd, model, effort }) {
   // --tools, not --allowedTools. They look interchangeable and are not:
   // --allowedTools only skips the permission prompt for the tools it names, and
@@ -701,7 +724,29 @@ async function askClaude({ question, cwd, model, effort }) {
     "mcp__*",
     ...modelArgs("--model", model, chosen.model || CLAUDE_MODEL),
   ];
-  return runAgent(CLAUDE_BIN, args, askFrame(question), cwd, ASK_TIMEOUT_MS);
+
+  const prompt = askFrame(question);
+  const first = await runAgent(CLAUDE_BIN, args, prompt, cwd, ASK_TIMEOUT_MS);
+  if (first.ok) return first;
+
+  const flag = rejectedFlag(first.raw || first.text);
+  if (!flag) return first;
+
+  if (!CLAUDE_OPTIONAL_FLAGS.has(flag)) {
+    return {
+      ...first,
+      ok: false,
+      text:
+        `Claude Code rejected ${flag}, which is part of ask_claude's read-only guarantee, so the call was not retried. ` +
+        `--restricted requires Claude Code 2.1.248 or newer; check \`claude --version\` and upgrade. ` +
+        `Answer from your own knowledge and tell the user ask_claude is unavailable on this machine.\n\n${first.text}`,
+    };
+  }
+
+  const retryArgs = args.filter((a) => a !== flag);
+  const second = await runAgent(CLAUDE_BIN, retryArgs, prompt, cwd, ASK_TIMEOUT_MS);
+  const note = `(agent-bridge: this Claude Code does not accept ${flag}; retried without it. The read-only flags were unaffected.)`;
+  return { ...second, text: `${note}\n\n${second.text}` };
 }
 
 // ---------------------------------------------------------------------------

@@ -114,6 +114,21 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
   boundaries: CLI sandboxes, a verification allowlist and stricter remote-mode
   behavior. It does not implement user identities or per-tool authorization.
 
+## Required flags versus hygiene flags
+
+`ask_claude` splits its arguments in two. `--restricted`, `--bare`, `--tools` and
+`--disallowedTools` carry the read-only guarantee: if the installed CLI rejects
+one, the call fails loudly and is never retried without it, because a silent
+retry would leave the tool looking read-only while it was not. Everything in
+`CLAUDE_OPTIONAL_FLAGS` is hygiene and is dropped on rejection with a note in the
+reply.
+
+`--no-session-persistence` is in the optional set for a reason: it has been
+removed from the CLI at least once and shipped as a no-op in another release,
+and it contributes nothing to isolation that `--restricted` and `--bare` do not
+already provide. Put a new flag in the required set only if losing it would
+weaken the contract.
+
 ## Unverified against a live CLI
 
 The suite substitutes stub executables, so it proves the bridge's behaviour and

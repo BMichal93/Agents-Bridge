@@ -23,8 +23,8 @@ across related tasks.
 
 - Node.js 18 or newer.
 - OpenAI Codex CLI installed and signed in with `codex login`.
-- Claude Code installed and signed in if you want Codex or VS Code to use
-  `ask_claude`.
+- Claude Code 2.1.248 or newer, installed and signed in, if you want Codex or
+  VS Code to use `ask_claude`. That version introduced restricted mode.
 - A Git repository is strongly recommended so the bridge can report the working
   tree before and after delegated work.
 
@@ -32,7 +32,7 @@ across related tasks.
 
 ### Claude Desktop
 
-1. Download `agent-bridge-0.9.6.mcpb` from Releases.
+1. Download `agent-bridge-0.9.7.mcpb` from Releases.
 2. Double-click it, or drag it into **Settings > Extensions**.
 3. Set **Default project folder** if requests will not always include an
    absolute `cwd`.
@@ -44,7 +44,7 @@ the local Codex CLI.
 ### VS Code, Claude Code and Codex CLI
 
 1. In VS Code, open **Extensions > ... > Install from VSIX**.
-2. Select `agent-bridge-0.9.6.vsix`.
+2. Select `agent-bridge-0.9.7.vsix`.
 3. Accept the one-time offer to enable the bridge for the Codex and Claude Code
    CLIs. You can run **Agent Bridge: Enable for Codex and Claude Code** later if
    you initially decline.
@@ -67,9 +67,16 @@ skill.
 | `set_project_context` | Save reusable repository context | Yes |
 | `ask_claude` | Get a read-only Claude Code review | No |
 
-`ask_codex` runs with Codex's `read-only` sandbox. Local delegation uses
-`workspace-write`. `ask_claude` exposes only Claude's `Read`, `Grep` and `Glob`
-built-in tools and blocks MCP tools for that child run.
+`ask_codex` runs with Codex's `read-only` sandbox, no persisted session, and no
+user config or execpolicy rules. This prevents configured MCP servers from
+adding side effects to a review; select its model through Agent Bridge rather
+than Codex user config. Local delegation uses `workspace-write` and retains the
+project's normal Codex configuration.
+
+`ask_claude` combines Claude Code's restricted and bare modes, does not persist
+a session, exposes only `Read`, `Grep` and `Glob`, and blocks MCP tools. This
+confines reads to the working directories and skips user/project hooks, skills,
+plugins, memory and MCP configuration for that child run.
 
 ## Recommended cooperation workflow
 
@@ -95,14 +102,22 @@ session ID from Codex's documented JSONL stream and scopes it to the absolute
 repository path, so an identical lane name in another repository stays separate.
 
 Use `start_codex_jobs` for multiple tasks. List exact files or directories,
-separated by commas, new lines or spaces; quote a path that contains a space. Tasks whose paths overlap are queued across
-separate calls; independent tasks run concurrently. Omitting `files`, or using a
-glob, safely treats the task as touching the entire workspace.
+separated by commas, new lines or spaces; quote a path that contains a space.
+Tasks whose paths overlap are queued across separate calls; independent tasks
+run concurrently up to the configured limit (four by default). Tasks sharing a
+lane are always serialized so they cannot race the same saved Codex thread.
+Omitting `files`, or using a glob, safely treats the task as touching the entire
+workspace. Claims coordinate background jobs inside one bridge process; they do
+not restrict what Codex can edit and they are not a cross-process file lock.
 
-After Codex finishes, the response shows verification first, then `git status
---short` for the working tree and any entries already present before delegation.
-The status includes untracked files. A passing command proves only what that
-command checks, so Claude should still inspect sensitive or surprising changes.
+After Codex finishes, the response shows verification first, then bounded
+working-tree observations. The bridge uses Git porcelain output plus file
+fingerprints, so it detects new entries, another edit to an already-dirty file,
+and a dirty entry that became clean. Untracked files are included and unchanged
+pre-existing entries are counted instead of repeated. The report says
+"observed during" rather than attributing concurrent repository activity to one
+process. A passing command proves only what that command checks, so Claude
+should still inspect sensitive or surprising changes.
 
 ## Effort and models
 
@@ -149,8 +164,21 @@ requires a random secret of at least 24 characters in the URL path.
 Remote writes are disabled by default. In that state Codex runs read-only,
 verification commands do not run, and `set_project_context` is unavailable.
 Setting `AGENT_BRIDGE_REMOTE_WRITES=1` grants remote callers the same local write
-capabilities as a desktop caller. Treat the URL as a credential and put the
-tunnel behind its own authentication.
+capabilities as a desktop caller. Even read-only mode lets a caller ask the local
+agents to inspect files under a supplied `cwd`, so treat the URL as a credential
+and put the tunnel behind its own authentication.
+
+The endpoint validates `Origin` to prevent browser DNS rebinding. Requests with
+no `Origin` (normal server-to-server connectors) are accepted. If a browser or
+tunnel sends one, list its exact origin in the comma-separated
+`AGENT_BRIDGE_HTTP_ALLOWED_ORIGINS`; every other origin is rejected. The bridge
+never writes the secret path to its own diagnostics, but a reverse proxy may log
+URLs, so configure its access logs accordingly.
+
+HTTP and stdio accept legacy initialize-based MCP clients and the current
+2026-07-28 per-request-metadata protocol. Modern HTTP calls validate the protocol,
+method and tool-name headers against the JSON body. Closing an HTTP connection
+cancels the peer process attached to that request.
 
 ## Failure behavior
 
@@ -162,7 +190,12 @@ tunnel behind its own authentication.
   process tree, including verification commands.
 - Verification commands are split into executable and arguments, never passed
   as a shell string. The first executable must be in
-  `AGENT_BRIDGE_VERIFY_ALLOW`.
+  `AGENT_BRIDGE_VERIFY_ALLOW`; quoted paths are supported.
+- The verification allowlist is not a security sandbox. Commands such as npm,
+  npx and language runtimes can execute arbitrary repository code with your user
+  privileges. Only verify repositories and commands you trust.
+- Peer and verification output is bounded while the process runs, before the
+  smaller final reply limit is applied.
 - Background work exists only for the lifetime of the MCP server. Closing its
   host cancels queued and running jobs.
 
@@ -180,18 +213,24 @@ first four for you.
 | `AGENT_BRIDGE_TIMEOUT_MS` | `300000` | Timeout for `ask_` tools |
 | `AGENT_BRIDGE_DELEGATE_TIMEOUT_MS` | `1800000` | Timeout for delegations and jobs |
 | `AGENT_BRIDGE_MAX_REPLY_CHARS` | `6000` | Trim a long peer reply before it reaches the caller |
+| `AGENT_BRIDGE_MAX_PROCESS_OUTPUT_CHARS` | `1000000` | Bound captured stdout/stderr while a peer runs |
 | `AGENT_BRIDGE_MAX_STATUS_LINES` | `40` | Cap on working-tree entries listed per delegation |
 | `AGENT_BRIDGE_MAX_FAILURES` | `2` | Failures of one peer before the breaker opens |
 | `AGENT_BRIDGE_CONTEXT_MAX` | `8000` | Cap on the injected project context |
 | `AGENT_BRIDGE_VERIFY_ALLOW` | test runners | Commands `verify` may run, matched on the first token |
+| `AGENT_BRIDGE_MAX_CONCURRENT_JOBS` | `4` | Maximum Codex background processes at once (hard cap 32) |
+| `AGENT_BRIDGE_MAX_JOBS_PER_CALL` | `8` | Maximum tasks accepted by one start call (hard cap 64) |
+| `AGENT_BRIDGE_MAX_OUTSTANDING_JOBS` | `64` | Running, queued or completed jobs awaiting collection (hard cap 512) |
 | `AGENT_BRIDGE_CODEX_MODEL` | unset | Blanket Codex model for bridged calls |
 | `AGENT_BRIDGE_CLAUDE_MODEL` | unset | Blanket Claude model for bridged calls |
 | `AGENT_BRIDGE_CODEX_APPROVAL` | `never` | Codex approval policy; empty omits the flag |
 | `AGENT_BRIDGE_CODEX_STDIN` | unset | `0` passes the prompt as an argument instead of stdin |
 | `AGENT_BRIDGE_CODEX_RESUME` | unset | `0` disables lanes if your Codex has no `exec resume` |
+| `AGENT_BRIDGE_HTTP` | unset | `1` enables HTTP mode without passing `--http` |
 | `AGENT_BRIDGE_REMOTE_SECRET` | unset | Required for `--http`; 24 characters or more |
 | `AGENT_BRIDGE_HTTP_PORT` | `7333` | Port for HTTP mode |
 | `AGENT_BRIDGE_HTTP_HOST` | `127.0.0.1` | Interface for HTTP mode; leave it on loopback |
+| `AGENT_BRIDGE_HTTP_ALLOWED_ORIGINS` | unset | Exact comma-separated browser origins; absent Origin remains allowed |
 | `AGENT_BRIDGE_REMOTE_WRITES` | unset | `1` gives remote callers local write capability |
 
 ## Does it actually save anything
@@ -223,8 +262,10 @@ Small tasks lose, and the tool says so rather than hiding it. Try
 than doing the work inline. The break-even is roughly one substantial delegation
 per session; below that, the tool definitions cost more than they save.
 
-What it does not measure: Codex's own quota, which is spent either way. This is
-about Claude's context, not total spend across both providers.
+What it does not measure: Codex's own quota, which is spent when work is
+delegated but not when Claude does it inline. This is a Claude-context estimate,
+not total spend across both providers, and it does not model provider caching or
+exact API billing.
 
 ## Checking your setup
 
@@ -232,14 +273,16 @@ about Claude's context, not total spend across both providers.
 npm run doctor
 ```
 
-The test suite uses stub CLIs, so it cannot tell whether the real Codex and
-Claude Code accept the flags the bridge passes. `doctor` checks each one against
-the installed CLIs and makes one live read-only Codex call. Run it after
-installing and after either CLI updates. `--no-live` skips the live call.
+The test suite uses stub CLIs, so it cannot prove that installed CLIs accept the
+real flags. `doctor` treats help output as advisory, then makes exact read-only
+Codex and Claude calls, validates Codex JSONL/thread IDs, and probes the Codex
+app-server rate-limit method. Run it after installing and after either CLI
+updates. `--no-live` avoids authenticated agent calls and the app-server probe.
 
-The check that matters most is `claude --tools`. `--allowedTools` only skips
-permission prompts and appends to the default tool set, so if `--tools` ever
-disappears, `ask_claude` stops being read-only while still looking like it is.
+Claude documents that `claude --help` does not show every supported flag, so a
+missing help token is reported as skipped rather than as proof of failure. The
+live exact-argument call is authoritative. Doctor does not perform a write-mode
+delegation or a live lane resume; those remain installation smoke tests.
 
 ## Development
 
@@ -258,6 +301,11 @@ packages. See `CLAUDE.md` for maintenance constraints and
 
 - Delegation reaches the local Codex CLI, using its configured account and
   model. It is not an API for controlling an open ChatGPT conversation.
+- Background scheduling and lane locks coordinate one Agent Bridge process.
+  Separate MCP hosts can launch separate bridge processes and require normal
+  repository/worktree isolation if they write concurrently.
+- `files` is a scheduling declaration, not an edit permission boundary. Always
+  inspect unexpected changes and keep sensitive work under source control.
 - The caller's chat history is not transferred automatically.
 - Direct, simultaneous `delegate_to_codex` calls can still target the same file.
   Use `start_codex_jobs` when coordinating more than one build.

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.7
+
+- Harden `ask_codex` with ephemeral sessions plus ignored user config/rules, and
+  harden `ask_claude` with restricted, bare, non-persistent execution in
+  addition to its explicit read-only tool list.
+- Support both legacy initialize-based MCP and MCP 2026-07-28 discovery,
+  per-request metadata and result fields. Modern HTTP requests validate mirrored
+  protocol, method and tool-name headers.
+- Validate HTTP Origin, redact the capability secret from diagnostics, return
+  empty 202 responses for notifications, bound request bodies, and cancel the
+  attached process when a client disconnects—even before the child starts.
+- Replace status-line-only Git deltas with NUL-safe porcelain parsing and file
+  fingerprints, detecting repeat edits to dirty files and dirty entries that
+  became clean. Disable Git fsmonitor hooks during snapshots.
+- Bound child output in memory while preserving Codex's opening thread ID and
+  final message. Bound app-server and rollout-log usage probes too.
+- Cap background concurrency, jobs per call and outstanding jobs; serialize a
+  shared lane; validate lane names and job IDs; discard collected jobs; normalize
+  Windows claims case-insensitively; save lane state atomically.
+- Parse quoted verification arguments and document that the executable allowlist
+  is not a sandbox: verification executes trusted repository code as the user.
+- Make doctor help checks advisory and add exact live read-only probes for both
+  CLIs plus the Codex app-server method.
+- Give the installed Claude delegation skill a collision-resistant managed name;
+  upgrades and removal no longer recursively delete a generic user skill folder.
+- Correct the budget explanation: Codex quota is consumed only by delegated
+  work, and the estimate does not model provider caching or total billing.
+- Expand integration coverage from 37 to 47 tests.
+
 ## 0.9.6
 
 - Fix: `doctor` matched flags as substrings, so `-a` was "found" inside

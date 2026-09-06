@@ -47,11 +47,27 @@ hit. The only free-form value that reaches argv is `model`, and it is checked
 against `^[A-Za-z0-9._:-]+$` first. Do not add a second one without the same
 check.
 
-**CLI flags drift.** Both Codex and Claude Code change flags between releases. If
-calls fail, compare the `args` arrays against `codex exec --help` and `claude
---help`. Codex calls request JSONL with `--json`; `thread.started` supplies the
-lane session ID and the last completed `agent_message` supplies returned text.
-Keep the plain-text fallback for old releases and test doubles.
+**CLI flags drift.** Both Codex and Claude Code change flags between releases.
+Claude explicitly documents that `claude --help` omits some flags, so help is an
+advisory, not a compatibility test. Run `npm run doctor`: its live probes use the
+same argument arrays as the bridge. Codex calls request JSONL with `--json`;
+`thread.started` supplies the lane session ID and the last completed
+`agent_message` supplies returned text. Keep the plain-text fallback for old
+releases and test doubles.
+
+**Read-only means configuration isolation too.** `ask_codex` combines a read-only
+sandbox with `--ephemeral --ignore-user-config --ignore-rules`, so user MCP and
+execpolicy configuration cannot add side effects. `ask_claude` combines
+`--restricted --bare --no-session-persistence` with an explicit read-only tool
+list and MCP denial. Do not weaken one layer because another appears redundant.
+Restricted mode requires Claude Code 2.1.248 or newer.
+
+**MCP has two eras.** Legacy clients initialize and negotiate a supported
+version. MCP 2026-07-28 uses per-request metadata and `server/discover`, and
+modern results require `resultType`; list results also require cache metadata.
+HTTP mirrors protocol, method and name into headers that must match the body.
+Keep both paths and their integration tests unless client support is deliberately
+dropped.
 
 **Tool descriptions are the prompt.** They are what decides whether the calling
 model reaches for a tool and when. Editing them is a behaviour change, not a docs
@@ -64,10 +80,12 @@ watching. There is a test for this; keep it passing.
 ## The verify path runs a model-supplied command
 
 `delegate_to_codex` and the job tools accept a `verify` command and the bridge
-runs it. That is a step beyond spawning a fixed CLI, so only the first token is
-matched against `AGENT_BRIDGE_VERIFY_ALLOW`. POSIX starts the executable directly.
-Windows `.cmd` shims require `cmd.exe`, so every token containing a shell
-metacharacter is rejected. If you widen this, keep both controls.
+runs it. Only the first token is matched against `AGENT_BRIDGE_VERIFY_ALLOW`.
+That is not a sandbox: npm scripts, npx and language runtimes can execute
+arbitrary trusted repository code with the user's privileges. POSIX starts the
+executable directly. Windows `.cmd` shims require `cmd.exe`, so every token
+containing a shell metacharacter is rejected. Quoted arguments are tokenized
+without invoking a shell. If you widen this, keep all controls and the warning.
 
 ## Testing philosophy
 
@@ -99,27 +117,25 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
 ## Unverified against a live CLI
 
 The suite substitutes stub executables, so it proves the bridge's behaviour and
-nothing about whether the real CLIs accept these. **`npm run doctor` checks every
-item on this list**; run it after installing and after either CLI updates.
+nothing about whether the real CLIs accept these. `npm run doctor` runs the exact
+read-only invocations and probes the app-server method. Run it after installing
+and after either CLI updates. It deliberately does not make a write-mode call or
+resume a real lane.
 
-- `claude --tools`. This is the one that matters. `--allowedTools` only skips
-  permission prompts and appends to the default tool set, so if `--tools` ever
-  goes away, `ask_claude` stops being read-only while still looking like it is.
-- `codex exec resume` and the `thread.started.thread_id` field in the JSONL
-  stream. Lanes depend on both; `AGENT_BRIDGE_CODEX_RESUME=0` disables them.
-- `codex -a never` and `-c model_reasoning_effort=...`, both behind env vars that
-  can drop them.
-- `codex app-server`'s `account/rateLimits/read` is an internal method name and
-  may move. There is a fallback and failure is silent by design.
+- A real write-mode Codex delegation. Doctor stays read-only by design.
+- A real `codex exec resume`. Doctor checks its advertised syntax and validates
+  `thread.started.thread_id` in a cold JSONL run, but does not spend a second
+  agent call resuming it. `AGENT_BRIDGE_CODEX_RESUME=0` disables lanes.
+- Windows behavior beyond CI.
 - The Codex desktop app reportedly shares MCP config with the Codex CLI. Sources
   conflict. The CLI and IDE extension are certain; the desktop app is not.
 
 ## Output is spent from the caller's context
 
-Everything a tool returns is re-sent on every later turn of the caller's session,
-so size is a feature, not a detail. Replies are trimmed to
-`AGENT_BRIDGE_MAX_REPLY_CHARS`, working-tree reporting is a bounded delta rather
-than two full listings, the project context is capped, and `start_codex_jobs`
+Everything a tool returns occupies the caller's context on later turns, so size
+is a feature, not a detail. Child output is bounded while it runs, replies are
+trimmed again to `AGENT_BRIDGE_MAX_REPLY_CHARS`, working-tree reporting is a
+fingerprinted bounded delta rather than two full listings, the project context is capped, and `start_codex_jobs`
 deliberately carries short field descriptions because the full guidance is
 already on `delegate_to_codex`. Tool definitions alone cost roughly 2300 tokens
 per session, and a test fails if they pass 11000 bytes. Before adding prose to a
@@ -129,11 +145,19 @@ a whole session.
 
 ## Coordination and remote access
 
-Background job claims are server-wide and use normalized absolute paths. A
-directory overlaps its descendants. Missing paths and globs claim the entire
-workspace. Preserve that conservative behavior when changing the scheduler.
-Queued jobs must resolve as failures during shutdown; otherwise they can start
-after the host has disappeared.
+Background job claims are process-wide and use normalized absolute paths
+(case-folded on Windows). A directory overlaps its descendants. Missing paths
+and globs claim the entire workspace. A global concurrency cap and outstanding
+queue cap bound resource use, and jobs sharing a lane serialize even when their
+files differ. Claims are scheduling declarations, not edit permissions or
+cross-process locks. Queued jobs must resolve as failures during shutdown;
+otherwise they can start after the host has disappeared.
+
+HTTP capability secrets must never appear in diagnostics. Validate Origin before
+processing a browser request, validate modern MCP headers against the body, and
+treat a closed connection as cancellation even when it closes before the peer
+process starts. A background job is intentionally detached from its initiating
+request's cancellation scope but remains owned by host shutdown.
 
 `AGENT_BRIDGE_REMOTE_WRITES=0` applies to every direct write path, not only the
 Codex sandbox. Project-context writes are hidden and rejected, and verification

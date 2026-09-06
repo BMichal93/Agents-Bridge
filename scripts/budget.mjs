@@ -10,8 +10,8 @@
  *   npm run budget
  *   npm run budget -- --files 8 --lines 220
  *
- * What is measured: the bytes this server returns, which is what lands in the
- * caller's context and is re-sent on every later turn.
+ * What is measured: the bytes this server returns, which land in and occupy the
+ * caller's context for later turns.
  *
  * What is estimated: what the same work would have cost inline. That depends on
  * your repository, so it is computed from two numbers you can set, and both are
@@ -142,7 +142,9 @@ await measure("start_codex_jobs (3 parallel)", "start_codex_jobs", {
 });
 await measure("collect_codex_jobs", "collect_codex_jobs", {});
 
+const stopped = new Promise((resolve) => proc.once("close", resolve));
 proc.kill();
+await Promise.race([stopped, new Promise((resolve) => setTimeout(resolve, 2000))]);
 
 // --- report ------------------------------------------------------------------
 const returned = measured.reduce((sum, m) => sum + m.bytes, 0);
@@ -159,7 +161,7 @@ const delegatedTotal = designBytes + specBytes + returned + definitionBytes;
 const pad = (n) => String(n).padStart(7);
 console.log("\nMeasured: bytes this server returned into the caller's context\n");
 for (const m of measured) console.log(`  ${pad(m.bytes)}  ${m.label}`);
-console.log(`  ${pad(definitionBytes)}  tool definitions (once per session, re-sent every turn)`);
+console.log(`  ${pad(definitionBytes)}  tool definitions (session context overhead)`);
 console.log(`  ${"-".repeat(7)}`);
 console.log(`  ${pad(returned + definitionBytes)}  total  (~${tokens(returned + definitionBytes)} tokens)`);
 
@@ -184,16 +186,17 @@ if (saved > 0) {
 
 console.log(`
 What this does not capture, in both directions:
-  - Codex's own quota is spent. This measures Claude's context, not total cost.
+  - Codex's own quota is spent only for delegated work. This is not total cost.
+  - Provider prompt caching and exact API billing are not modeled.
   - Claude may grep rather than read whole files, which narrows the gap.
   - A delegation you have to re-read in full, or redo, wipes out its saving.
   - Small tasks lose: the handoff costs about what the code would have.
     Try --files 1 --lines 40 --written 15 to see that happen.`);
 
 console.log(`
-Why this matters more than it looks: a coding agent re-sends the whole
-transcript every turn, so context spent early is paid again on every later
-turn. Bytes kept out of the transcript are saved repeatedly, not once.
+Why this matters more than it looks: a coding session retains its prior
+transcript, so context spent early reduces room on every later turn. Bytes kept
+out of that transcript preserve the working window for the rest of the session.
 
 Change the assumptions to match your repository:
   npm run budget -- --files ${FILES_PER_TASK} --lines ${LINES_PER_FILE} --design-files ${DESIGN_FILES}

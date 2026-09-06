@@ -35,6 +35,54 @@ test("handshake and tool listing", async () => {
   c.close();
 });
 
+test("modern MCP discovery and per-request results coexist with legacy initialize", async () => {
+  const { env } = setup({ stdout: "modern answer" });
+  const c = client(env);
+  const meta = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": { name: "test", version: "1" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+
+  const discovered = await c.send("server/discover", { _meta: meta });
+  assert.deepEqual(discovered.result.supportedVersions, ["2026-07-28"]);
+  assert.equal(discovered.result.resultType, "complete");
+  assert.equal(discovered.result._meta["io.modelcontextprotocol/serverInfo"].name, "agent-bridge");
+
+  const listed = await c.send("tools/list", { _meta: meta });
+  assert.equal(listed.result.resultType, "complete");
+  assert.equal(listed.result.ttlMs, 0);
+  assert.equal(listed.result.cacheScope, "private");
+
+  const called = await c.send("tools/call", { _meta: meta, name: "ask_codex", arguments: { question: "q" } });
+  assert.equal(called.result.resultType, "complete");
+  assert.match(c.text(called), /modern answer/);
+  c.close();
+});
+
+test("unsupported modern MCP versions are rejected and legacy versions are negotiated honestly", async () => {
+  const { env } = setup();
+  const c = client(env);
+  const unsupported = await c.send("tools/list", {
+    _meta: {
+      "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+      "io.modelcontextprotocol/clientCapabilities": {},
+    },
+  });
+  assert.equal(unsupported.error.code, -32022);
+  assert.equal(unsupported.error.data.requested, "2099-01-01");
+  assert.ok(unsupported.error.data.supported.includes("2026-07-28"));
+
+  const negotiated = await c.send("initialize", {
+    protocolVersion: "2099-01-01",
+    capabilities: {},
+    clientInfo: { name: "old-client", version: "1" },
+  });
+  assert.notEqual(negotiated.result.protocolVersion, "2099-01-01");
+  assert.ok(["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"].includes(negotiated.result.protocolVersion));
+  c.close();
+});
+
 test("unknown methods get a proper JSON-RPC error, not a crash", async () => {
   const { env } = setup();
   const c = client(env);
@@ -82,8 +130,14 @@ test("questions run read-only, delegations run workspace-write", async () => {
   const { env } = setup({ echoArgs: true });
   const c = client(env);
   await c.init();
-  assert.match(c.text(await c.call("ask_codex", { question: "q" })), /--sandbox read-only/);
-  assert.match(c.text(await c.call("delegate_to_codex", { task: "t" })), /--sandbox workspace-write/);
+  const question = c.text(await c.call("ask_codex", { question: "q" }));
+  assert.match(question, /--sandbox read-only/);
+  assert.match(question, /--ignore-user-config/);
+  assert.match(question, /--ignore-rules/);
+  assert.match(question, /--ephemeral/);
+  const delegation = c.text(await c.call("delegate_to_codex", { task: "t" }));
+  assert.match(delegation, /--sandbox workspace-write/);
+  assert.ok(!delegation.includes("--ignore-user-config"), "write delegations should retain project/user configuration");
   c.close();
 });
 
@@ -94,6 +148,9 @@ test("ask_claude exposes only read tools and blocks MCP tools", async () => {
   const text = c.text(await c.call("ask_claude", { question: "q" }));
   assert.match(text, /--tools Read,Grep,Glob/);
   assert.match(text, /--disallowedTools mcp__\*/);
+  assert.match(text, /--restricted/);
+  assert.match(text, /--bare/);
+  assert.match(text, /--no-session-persistence/);
   assert.ok(!text.includes("--allowedTools"));
   c.close();
 });
@@ -165,6 +222,27 @@ test("a long reply is trimmed, keeping the head and the tail", async () => {
   assert.match(text, /narration line 0/);
   assert.match(text, /FINAL ANSWER/);
   assert.match(text, /trimmed by agent-bridge/);
+  c.close();
+});
+
+test("peer output is bounded while preserving Codex's thread id and final JSONL message", async () => {
+  const sessionId = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+  const stdout = [
+    JSON.stringify({ type: "thread.started", thread_id: sessionId }),
+    "x".repeat(100_000),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "FINAL survives" } }),
+    JSON.stringify({ type: "turn.completed", usage: {} }),
+  ].join("\n");
+  const { env, home } = setup({ stdout });
+  const repo = path.join(home, "bounded-output");
+  fs.mkdirSync(repo, { recursive: true });
+  const c = client({ ...env, AGENT_BRIDGE_MAX_PROCESS_OUTPUT_CHARS: "1200" });
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t", lane: "bounded", cwd: repo }));
+  assert.match(text, /FINAL survives/);
+  assert.ok(text.length < 4000, `bounded result was ${text.length} characters`);
+  const lanes = JSON.parse(fs.readFileSync(path.join(home, ".agent-bridge", "lanes.json"), "utf8"));
+  assert.equal(lanes.scopes[repo].bounded.sessionId, sessionId);
   c.close();
 });
 
@@ -286,22 +364,61 @@ test("HTTP mode rejects a wrong secret and serves the right one", async () => {
   const home = sandbox();
 
   const srv = spawn(process.execPath, [SERVER, "--http"], {
-    env: { ...process.env, HOME: home, USERPROFILE: home, AGENT_BRIDGE_REMOTE_SECRET: secret, AGENT_BRIDGE_HTTP_PORT: String(port) },
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      AGENT_BRIDGE_REMOTE_SECRET: secret,
+      AGENT_BRIDGE_HTTP_PORT: String(port),
+      AGENT_BRIDGE_HTTP_ALLOWED_ORIGINS: "https://claude.ai",
+    },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  let serverErr = "";
+  srv.stderr.on("data", (chunk) => (serverErr += chunk));
   await wait(1200);
 
   const init = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } };
-  const post = (p, body) =>
-    fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const post = (p, body, headers = {}) =>
+    fetch(`http://127.0.0.1:${port}${p}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
 
   // Same length as the real one, so this also exercises the timing-safe compare.
   const wrong = await post(`/mcp/${"0".repeat(secret.length)}`, init);
   assert.equal(wrong.status, 404);
+  assert.ok(!serverErr.includes(secret), "HTTP diagnostics leaked the capability secret");
 
-  const right = await post(`/mcp/${secret}`, init);
+  const badOrigin = await post(`/mcp/${secret}`, init, { origin: "https://evil.example" });
+  assert.equal(badOrigin.status, 403);
+
+  const right = await post(`/mcp/${secret}`, init, { origin: "https://claude.ai" });
   assert.equal(right.status, 200);
   assert.equal((await right.json()).result.serverInfo.name, "agent-bridge");
+
+  const notification = await post(`/mcp/${secret}`, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+  assert.equal(notification.status, 202);
+  assert.equal(await notification.text(), "");
+
+  const modernMeta = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+  const discoverBody = { jsonrpc: "2.0", id: 10, method: "server/discover", params: { _meta: modernMeta } };
+  const modernHeaders = { "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "server/discover" };
+  const modern = await post(`/mcp/${secret}`, discoverBody, modernHeaders);
+  assert.equal(modern.status, 200);
+  assert.deepEqual((await modern.json()).result.supportedVersions, ["2026-07-28"]);
+
+  const badHeaders = await post(
+    `/mcp/${secret}`,
+    { jsonrpc: "2.0", id: 11, method: "tools/call", params: { _meta: modernMeta, name: "ask_codex", arguments: { question: "q" } } },
+    { "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call", "Mcp-Name": "delegate_to_codex" }
+  );
+  assert.equal(badHeaders.status, 400);
+  assert.equal((await badHeaders.json()).error.code, -32020);
 
   // A remote caller must not get write access without an explicit opt-in.
   const del = await post(`/mcp/${secret}`, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "delegate_to_codex", arguments: { task: "t" } } });
@@ -335,6 +452,49 @@ test("HTTP mode rejects a wrong secret and serves the right one", async () => {
   srv.kill();
 });
 
+test("closing an HTTP request cancels its peer process", async () => {
+  const { spawn } = await import("node:child_process");
+  const nodeNet = await import("node:net");
+  const crypto = await import("node:crypto");
+  const { SERVER } = await import("./helpers.mjs");
+  const { env, home } = setup();
+  const secret = crypto.randomBytes(24).toString("hex");
+  const port = 7900 + Math.floor(Math.random() * 700);
+  const started = path.join(home, "http-child-started");
+  const survived = path.join(home, "http-child-survived");
+  fs.writeFileSync(
+    path.join(home, "bin", "codex.stub.mjs"),
+    `import fs from "node:fs";\nif (process.argv.includes("app-server")) process.exit(0);\nfs.writeFileSync(${JSON.stringify(started)}, "x");\nsetTimeout(() => fs.writeFileSync(${JSON.stringify(survived)}, "x"), 2500);\nprocess.stdin.resume();\n`
+  );
+  const srv = spawn(process.execPath, [SERVER, "--http"], {
+    env: { ...process.env, ...env, AGENT_BRIDGE_REMOTE_SECRET: secret, AGENT_BRIDGE_HTTP_PORT: String(port) },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  await wait(1000);
+  try {
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "delegate_to_codex", arguments: { task: "wait", cwd: home } },
+    });
+    const socket = nodeNet.createConnection({ host: "127.0.0.1", port });
+    socket.on("error", () => {});
+    await new Promise((resolve) => socket.once("connect", resolve));
+    socket.write(
+      `POST /mcp/${secret} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nContent-Type: application/json\r\n` +
+        `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`
+    );
+    for (let i = 0; i < 100 && !fs.existsSync(started); i++) await wait(25);
+    assert.equal(fs.existsSync(started), true, "peer did not start");
+    socket.destroy();
+    await wait(3000);
+    assert.equal(fs.existsSync(survived), false, "peer survived the closed HTTP response");
+  } finally {
+    srv.kill();
+  }
+});
+
 test("a verify command turns a delegation into a verdict", async () => {
   const { env } = setup({ stdout: "I changed some files." });
   const c = client(env);
@@ -352,6 +512,20 @@ test("a verify command turns a delegation into a verdict", async () => {
   // The verdict must lead and Codex's prose must trail.
   assert.ok(passed.indexOf("verify") < passed.indexOf("codex said:"), "verdict should come first");
   c2.close();
+});
+
+test("verify commands preserve quoted paths containing spaces", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "verify spaces");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, "check file.mjs"), "process.exit(0);\n");
+  const c = client({ ...env, AGENT_BRIDGE_VERIFY_ALLOW: "node" });
+  await c.init();
+  const text = c.text(
+    await c.call("delegate_to_codex", { task: "t", cwd: repo, verify: 'node "check file.mjs"' })
+  );
+  assert.match(text, /verify `node "check file\.mjs"` PASSED/);
+  c.close();
 });
 
 test("missing verify is called out rather than passing silently", async () => {
@@ -433,6 +607,63 @@ test("overlapping jobs are queued across separate start calls", async () => {
   const collected = c.text(await c.call("collect_codex_jobs", {}));
   assert.match(collected, /job-1/);
   assert.match(collected, /job-2/);
+  c.close();
+});
+
+test("background concurrency is capped even for independent files", async () => {
+  const { env } = setup({ stdout: "built", sleepMs: 250 });
+  const c = client({ ...env, AGENT_BRIDGE_MAX_CONCURRENT_JOBS: "2" });
+  await c.init();
+  const started = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [
+        { task: "one", files: "one.ts" },
+        { task: "two", files: "two.ts" },
+        { task: "three", files: "three.ts" },
+        { task: "four", files: "four.ts" },
+      ],
+    })
+  );
+  assert.match(started, /2 running, 2 queued/);
+  await c.call("collect_codex_jobs", {});
+  c.close();
+});
+
+test("jobs in the same lane serialize even when their files do not overlap", async () => {
+  const { env } = setup({ stdout: "built", sleepMs: 250 });
+  const c = client(env);
+  await c.init();
+  const started = c.text(
+    await c.call("start_codex_jobs", {
+      tasks: [
+        { task: "one", files: "one.ts", lane: "shared-lane" },
+        { task: "two", files: "two.ts", lane: "shared-lane" },
+      ],
+    })
+  );
+  assert.match(started, /1 running, 1 queued/);
+  await c.call("collect_codex_jobs", {});
+  c.close();
+});
+
+test("job limits, lane names and collect ids are validated", async () => {
+  const { env } = setup({ stdout: "built", sleepMs: 50 });
+  const c = client({ ...env, AGENT_BRIDGE_MAX_JOBS_PER_CALL: "2" });
+  await c.init();
+  const tooMany = await c.call("start_codex_jobs", {
+    tasks: [
+      { task: "one", files: "one.ts" },
+      { task: "two", files: "two.ts" },
+      { task: "three", files: "three.ts" },
+    ],
+  });
+  assert.match(tooMany.error.message, /at most 2 jobs/);
+
+  const badLane = await c.call("delegate_to_codex", { task: "t", lane: "__proto__" });
+  assert.match(badLane.error.message, /lane must be/);
+
+  const unknown = await c.call("collect_codex_jobs", { ids: ["job-999"] });
+  assert.match(unknown.error.message, /unknown job id/);
   c.close();
 });
 
@@ -586,9 +817,58 @@ test("git summary reports the delta, not two full listings", async () => {
 
   // Nothing new was written by the stub, so the pre-existing mess must be
   // summarised as a count rather than listed again.
-  assert.match(text, /no new working-tree entries/);
+  assert.match(text, /no working-tree changes detected/);
   assert.match(text, /6 entries were already present/);
   assert.ok(!text.includes("pre-4.txt"), "pre-existing files should not be listed");
+  c.close();
+});
+
+test("git summary detects another edit to an already-dirty file", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "dirty-again");
+  fs.mkdirSync(repo, { recursive: true });
+  const run = (...args) => spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  run("init", "-q");
+  run("config", "user.email", "t@t");
+  run("config", "user.name", "t");
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "committed\n");
+  run("add", "-A");
+  run("commit", "-qm", "init");
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before\n");
+  fs.writeFileSync(
+    path.join(home, "bin", "codex.stub.mjs"),
+    `import fs from "node:fs";\nfs.appendFileSync(${JSON.stringify(path.join(repo, "tracked.txt"))}, "changed during delegation\\n");\nconsole.log("done");\n`
+  );
+
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t", cwd: repo }));
+  assert.match(text, /working-tree changes observed during this delegation/);
+  assert.match(text, / M tracked\.txt/);
+  c.close();
+});
+
+test("git summary reports a pre-existing dirty entry that was cleared", async () => {
+  const { env, home } = setup({ stdout: "done" });
+  const repo = path.join(home, "dirty-cleared");
+  fs.mkdirSync(repo, { recursive: true });
+  const run = (...args) => spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+  run("init", "-q");
+  run("config", "user.email", "t@t");
+  run("config", "user.name", "t");
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "committed\n");
+  run("add", "-A");
+  run("commit", "-qm", "init");
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before\n");
+  fs.writeFileSync(
+    path.join(home, "bin", "codex.stub.mjs"),
+    `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(path.join(repo, "tracked.txt"))}, "committed\\n");\nconsole.log("done");\n`
+  );
+
+  const c = client(env);
+  await c.init();
+  const text = c.text(await c.call("delegate_to_codex", { task: "t", cwd: repo }));
+  assert.match(text, /cleared:  M tracked\.txt/);
   c.close();
 });
 
@@ -616,7 +896,7 @@ test("a large number of new entries is capped", async () => {
   const c = client({ ...env, AGENT_BRIDGE_MAX_STATUS_LINES: "10" });
   await c.init();
   const text = c.text(await c.call("delegate_to_codex", { task: "t", cwd: repo }));
-  assert.match(text, /changed by this delegation \(12\d\)/);
+  assert.match(text, /working-tree changes observed during this delegation \(12\d\)/);
   assert.match(text, /and 1\d\d more/);
   c.close();
 });

@@ -1,5 +1,8 @@
 # Agent Bridge 0.9.6 handoff to Codex
 
+> Historical input to the 0.9.7 review. For current findings and remaining
+> checks, read `CODEX_REVIEW.md` and `START_HERE_CLAUDE.md`.
+
 Return leg of the review that produced 0.9.1. This records what Claude verified,
 what it changed, and what remains unproven, so the analysis does not have to be
 reconstructed.

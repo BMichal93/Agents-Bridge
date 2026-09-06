@@ -32,7 +32,14 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.6";
+const SERVER_VERSION = "0.9.7";
+const MODERN_PROTOCOL_VERSION = "2026-07-28";
+const LEGACY_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+function positiveInt(value, fallback, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
+}
 
 // Questions come back in a minute or two. Real work takes longer, so the two
 // paths get separate budgets rather than one compromise value.
@@ -44,6 +51,10 @@ const DELEGATE_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_DELEGATE_TIMEOUT_MS)
 // only pays for itself if what comes back is small, so a verbose reply gets cut
 // rather than quietly costing you the savings you delegated for.
 const MAX_REPLY_CHARS = Number(process.env.AGENT_BRIDGE_MAX_REPLY_CHARS) || 6000;
+// Child output is bounded while the process is running, not only when its final
+// reply is formatted. A noisy or malicious peer must not be able to exhaust the
+// host process before MAX_REPLY_CHARS gets a chance to trim the answer.
+const MAX_PROCESS_OUTPUT_CHARS = positiveInt(process.env.AGENT_BRIDGE_MAX_PROCESS_OUTPUT_CHARS, 1_000_000, 10_000_000);
 
 // Neither CLI is told which model to use unless you say so here, so by default
 // each one uses whatever its own config already selects. Setting these lets you
@@ -141,11 +152,17 @@ function resolveEffort(peer, effort) {
 // and says so, which costs the caller one short message instead of one long
 // timeout per attempt for the rest of the session.
 // HTTP mode, off unless asked for. See startHttp for why the defaults are strict.
-const REMOTE_MODE = process.argv.includes("--http") || Boolean(process.env.AGENT_BRIDGE_REMOTE_SECRET && process.env.AGENT_BRIDGE_HTTP);
+const REMOTE_MODE = process.argv.includes("--http") || process.env.AGENT_BRIDGE_HTTP === "1";
 const REMOTE_SECRET = process.env.AGENT_BRIDGE_REMOTE_SECRET || "";
 const REMOTE_PORT = Number(process.env.AGENT_BRIDGE_HTTP_PORT) || 7333;
 const REMOTE_HOST = process.env.AGENT_BRIDGE_HTTP_HOST || "127.0.0.1";
 const REMOTE_WRITES = process.env.AGENT_BRIDGE_REMOTE_WRITES === "1";
+const HTTP_ALLOWED_ORIGINS = new Set(
+  (process.env.AGENT_BRIDGE_HTTP_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
 
 const MAX_FAILURES = Number(process.env.AGENT_BRIDGE_MAX_FAILURES) || 2;
 const failures = { Codex: 0, Claude: 0 };
@@ -163,7 +180,7 @@ function diagnose(text) {
 function capped(text) {
   if (text.length <= MAX_REPLY_CHARS) return text;
   // Keep the head (what it set out to do) and the tail (what it concluded and
-  // the diff stat, which is appended last). The middle is usually narration.
+  // the working-tree report, which is appended last). The middle is narration.
   const head = text.slice(0, Math.floor(MAX_REPLY_CHARS * 0.4));
   const tail = text.slice(-Math.floor(MAX_REPLY_CHARS * 0.6));
   return `${head}\n\n[... ${text.length - MAX_REPLY_CHARS} characters trimmed by agent-bridge ...]\n\n${tail}`;
@@ -200,11 +217,16 @@ const safeForWindowsCmd = (value) => !/[&|<>^%!()"\r\n]/.test(value);
 const liveChildren = new Set();
 const requestScope = new AsyncLocalStorage();
 const requestChildren = new Map();
+const cancelledRequests = new Set();
 
 function trackChild(child) {
   liveChildren.add(child);
   const requestId = requestScope.getStore();
   if (requestId === undefined) return;
+  if (cancelledRequests.has(requestId)) {
+    killTree(child);
+    return;
+  }
   if (!requestChildren.has(requestId)) requestChildren.set(requestId, new Set());
   requestChildren.get(requestId).add(child);
 }
@@ -218,12 +240,21 @@ function untrackChild(child) {
 }
 
 function cancelRequest(requestId) {
-  for (const child of requestChildren.get(requestId) || []) {
+  if (requestId === undefined) return;
+  cancelledRequests.add(requestId);
+  const children = requestChildren.get(requestId) || [];
+  for (const child of children) {
     try {
       killTree(child);
     } catch {}
   }
   requestChildren.delete(requestId);
+}
+
+function clearRequest(requestId) {
+  if (requestId === undefined) return;
+  requestChildren.delete(requestId);
+  cancelledRequests.delete(requestId);
 }
 
 function killTree(child) {
@@ -307,6 +338,31 @@ function parseCodexJsonLines(output) {
   };
 }
 
+function boundedBuffer(limit, headRatio = 0.25) {
+  const headLimit = Math.floor(limit * headRatio);
+  const tailLimit = limit - headLimit;
+  let head = "";
+  let tail = "";
+  let total = 0;
+
+  return {
+    append(chunk) {
+      let text = String(chunk);
+      total += text.length;
+      if (head.length < headLimit) {
+        const take = Math.min(headLimit - head.length, text.length);
+        head += text.slice(0, take);
+        text = text.slice(take);
+      }
+      if (text && tailLimit) tail = (tail + text).slice(-tailLimit);
+    },
+    text() {
+      if (total <= limit) return head + tail;
+      return `${head}\n[... ${total - limit} process-output characters trimmed by agent-bridge ...]\n${tail}`;
+    },
+  };
+}
+
 function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {}) {
   return new Promise((resolve) => {
     if (IS_WINDOWS && [bin, ...args].some((value) => !safeForWindowsCmd(value))) {
@@ -326,8 +382,10 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
 
     trackChild(child);
 
-    let out = "";
-    let err = "";
+    // Keep the start of stdout for Codex's thread.started event and the end for
+    // its final agent_message. Stderr only needs its diagnostic tail.
+    const out = boundedBuffer(MAX_PROCESS_OUTPUT_CHARS, 0.25);
+    const err = boundedBuffer(Math.min(MAX_PROCESS_OUTPUT_CHARS, 200_000), 0);
     let done = false;
     const finish = (result) => {
       if (done) return;
@@ -347,12 +405,13 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
       });
     }, timeoutMs);
 
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d)); // both CLIs stream progress here
+    child.stdout.on("data", (d) => out.append(d));
+    child.stderr.on("data", (d) => err.append(d)); // both CLIs stream progress here
     child.on("error", (e) => finish({ ok: false, text: `(could not start ${bin}: ${e.message})`, raw: e.message }));
     child.on("close", (code, signal) => {
-      const parsed = codexJson ? parseCodexJsonLines(out) : { text: out.trim(), sessionId: null, failed: false, errors: "" };
-      const stderrTail = err.trim().split("\n").slice(-12).join("\n");
+      const stdout = out.text();
+      const parsed = codexJson ? parseCodexJsonLines(stdout) : { text: stdout.trim(), sessionId: null, failed: false, errors: "" };
+      const stderrTail = err.text().trim().split("\n").slice(-12).join("\n");
       const ok = code === 0 && !signal && !parsed.failed;
       if (ok && parsed.text) return finish({ ok: true, text: parsed.text, sessionId: parsed.sessionId });
 
@@ -380,16 +439,80 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
  */
 function gitSnapshot(cwd) {
   return new Promise((resolve) => {
+    const base = cwd || DEFAULT_CWD || process.cwd();
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "git";
-    const gitArgs = ["status", "--short", "--untracked-files=all"];
+    // -z is unambiguous for spaces, quotes and newlines in filenames. Porcelain
+    // v1 is stable across Git versions and reverses rename fields in -z mode.
+    const gitArgs = ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"];
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", "git", ...gitArgs] : gitArgs;
-    const child = spawn(file, argv, { cwd: cwd || DEFAULT_CWD || process.cwd(), stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(file, argv, { cwd: base, stdio: ["ignore", "pipe", "ignore"] });
     let out = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.on("error", () => resolve(null)); // not a git repo, or no git: skip silently
-    child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
-    setTimeout(() => child.kill(), 10_000);
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    child.stdout.on("data", (d) => {
+      out += d;
+      // A repository with millions of unignored files should not take its MCP
+      // host down. Reporting unavailable is safer than retaining unbounded data.
+      if (out.length > 5_000_000) {
+        child.kill();
+        finish(null);
+      }
+    });
+    child.on("error", () => finish(null)); // not a git repo, or no git: skip silently
+    child.on("close", (code) => finish(code === 0 ? snapshotEntries(base, out) : null));
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, 10_000);
   });
+}
+
+function gitPathDisplay(value) {
+  return /[\0-\x20\x7f]/.test(value) ? JSON.stringify(value) : value;
+}
+
+function fileFingerprint(base, relative) {
+  const file = path.resolve(base, relative);
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) return `link:${fs.readlinkSync(file)}`;
+    if (!stat.isFile()) return `other:${stat.mode}:${stat.size}:${stat.mtimeMs}`;
+    // Hash ordinary source files so a second edit to an already-dirty path is
+    // visible. Large generated files use metadata to keep snapshots bounded.
+    if (stat.size <= 2_000_000) {
+      return `sha256:${crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
+    }
+    return `large:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function snapshotEntries(base, raw) {
+  const records = raw.split("\0");
+  const entries = new Map();
+  for (let i = 0; i < records.length; ) {
+    const record = records[i++];
+    if (!record || record.length < 4) continue;
+    const status = record.slice(0, 2);
+    const target = record.slice(3);
+    const renamed = /[RC]/.test(status);
+    const source = renamed ? records[i++] || "" : "";
+    const key = IS_WINDOWS ? target.toLowerCase() : target;
+    entries.set(key, {
+      status,
+      target,
+      source,
+      fingerprint: fileFingerprint(base, target),
+      display: `${status} ${gitPathDisplay(target)}${source ? ` <- ${gitPathDisplay(source)}` : ""}`,
+    });
+  }
+  return { entries };
 }
 
 // Everything this returns is spent from the caller's context window on every
@@ -400,28 +523,33 @@ const MAX_STATUS_LINES = Number(process.env.AGENT_BRIDGE_MAX_STATUS_LINES) || 40
 
 function formatGitSummary(before, after) {
   if (after === null) return "(no git status available: not a git repository, or git is not on PATH)";
-  if (!after) return "working tree after delegation: clean";
+  const beforeEntries = before?.entries || new Map();
+  const afterEntries = after.entries;
+  const observed = [];
+  let carried = 0;
 
-  const afterLines = after.split("\n").filter(Boolean);
-  const beforeLines = before ? before.split("\n").filter(Boolean) : [];
-  const beforeSet = new Set(beforeLines);
-  const fresh = afterLines.filter((line) => !beforeSet.has(line));
-  const carried = afterLines.length - fresh.length;
+  for (const [key, entry] of afterEntries) {
+    const prior = beforeEntries.get(key);
+    if (!prior || prior.status !== entry.status || prior.fingerprint !== entry.fingerprint) observed.push(entry.display);
+    else carried++;
+  }
+  for (const [key, entry] of beforeEntries) {
+    if (!afterEntries.has(key)) observed.push(`cleared: ${entry.display}`);
+  }
 
-  // A file already modified before the run shows the same status line after it,
-  // so a further edit to it is invisible here. Say so rather than implying the
-  // delta is the whole truth.
   const caveat = carried
-    ? `\n${carried} entr${carried === 1 ? "y was" : "ies were"} already present before this delegation; ` +
-      "further edits to those cannot be distinguished from git status alone."
+    ? `\n${carried} entr${carried === 1 ? "y was" : "ies were"} already present before this delegation and remained unchanged; omitted.`
     : "";
 
-  if (!fresh.length) return `no new working-tree entries from this delegation.${caveat}`;
+  if (!observed.length) {
+    if (!afterEntries.size && !beforeEntries.size) return "working tree after delegation: clean";
+    return `no working-tree changes detected during this delegation.${caveat}`;
+  }
 
-  const shown = fresh.slice(0, MAX_STATUS_LINES);
-  const hidden = fresh.length - shown.length;
+  const shown = observed.slice(0, MAX_STATUS_LINES);
+  const hidden = observed.length - shown.length;
   return (
-    `changed by this delegation (${fresh.length}):\n${shown.join("\n")}` +
+    `working-tree changes observed during this delegation (${observed.length}):\n${shown.join("\n")}` +
     (hidden ? `\n... and ${hidden} more (raise AGENT_BRIDGE_MAX_STATUS_LINES to see them)` : "") +
     caveat
   );
@@ -489,7 +617,10 @@ function codexArgs({ write, prompt, model, effort, resumeId }) {
     "--skip-git-repo-check",
     "--json",
     ...modelArgs("-m", model, chosen.model || CODEX_MODEL),
-    ...(!write ? ["--ephemeral"] : []),
+    // A read-only sandbox prevents workspace edits. Ignoring user config and
+    // execpolicy rules also removes user-configured MCP servers and automation
+    // policy from a question/review run, closing side-effect paths outside Git.
+    ...(!write ? ["--ephemeral", "--ignore-user-config", "--ignore-rules"] : []),
     // Exec options belong before its optional `resume` subcommand.
     ...(resumeId ? ["resume", resumeId] : []),
     ...(CODEX_STDIN ? ["-"] : []),
@@ -503,7 +634,7 @@ async function askCodex({ question, cwd, model, effort }) {
   return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS, { codexJson: true });
 }
 
-async function delegateToCodex({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes, lane }) {
+async function delegateToCodexUnlocked({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes, lane }) {
   // Over HTTP the default is read-only. A remote caller that can write files on
   // your machine is a different kind of thing from a local one, so it has to be
   // turned on deliberately rather than inherited from the local behaviour.
@@ -541,17 +672,28 @@ async function delegateToCodex({ task, files, constraints, acceptance, verify: v
   return { ...r, ok: r.ok && (!verify || !verify.ran || verify.ok), text: parts.join("\n\n") };
 }
 
+async function delegateToCodex(spec) {
+  validateLane(spec.lane);
+  return withLaneLock(spec.lane, spec.cwd, () => delegateToCodexUnlocked(spec));
+}
+
 async function askClaude({ question, cwd, model, effort }) {
   // --tools, not --allowedTools. They look interchangeable and are not:
   // --allowedTools only skips the permission prompt for the tools it names, and
   // it appends to Claude Code's default tool set rather than replacing it, so a
   // run started that way still has Edit, Write and Bash available. --tools is
-  // the flag that decides which built-in tools exist at all. This is the whole
-  // read-only guarantee of ask_claude, and `npm run doctor` checks the flag is
-  // still there, because losing it would silently remove the guarantee while
-  // everything kept working.
+  // the flag that decides which built-in tools exist at all. Restricted and bare
+  // modes additionally remove settings, hooks, plugins, skills, memory and MCP.
+  // `npm run doctor` exercises this exact argument combination against the
+  // installed CLI because a help listing alone is not authoritative.
   const chosen = resolveEffort("claude", effort);
   const args = [
+    // Restricted confines file reads to the working directories and ignores
+    // user/project settings. Bare skips hooks, plugins, MCP, skills and memory.
+    // The explicit tool lists remain defense in depth and document the contract.
+    "--restricted",
+    "--bare",
+    "--no-session-persistence",
     "-p",
     "--tools",
     "Read,Grep,Glob",
@@ -608,6 +750,14 @@ function readProjectContext(cwd) {
 
 const RESUME_ENABLED = process.env.AGENT_BRIDGE_CODEX_RESUME !== "0";
 const LANES_FILE = path.join(STATE_DIR, "lanes.json");
+const SAFE_LANE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const laneLocks = new Map();
+
+function validateLane(lane) {
+  if (lane !== undefined && lane !== "" && (typeof lane !== "string" || !SAFE_LANE.test(lane))) {
+    throw new Error("lane must be 1-64 letters, numbers, dots, underscores or hyphens, starting with a letter or number");
+  }
+}
 
 function loadLanes() {
   try {
@@ -617,7 +767,27 @@ function loadLanes() {
   }
 }
 
-const laneScope = (cwd) => path.resolve(cwd || DEFAULT_CWD || process.cwd());
+const laneScope = (cwd) => {
+  const scope = path.resolve(cwd || DEFAULT_CWD || process.cwd());
+  return IS_WINDOWS ? scope.toLowerCase() : scope;
+};
+
+async function withLaneLock(lane, cwd, work) {
+  if (!lane) return work();
+  const key = `${laneScope(cwd)}\0${lane}`;
+  const prior = laneLocks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const tail = prior.then(() => gate);
+  laneLocks.set(key, tail);
+  await prior;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (laneLocks.get(key) === tail) laneLocks.delete(key);
+  }
+}
 
 function loadLane(lane, cwd) {
   const saved = loadLanes();
@@ -625,6 +795,7 @@ function loadLane(lane, cwd) {
 }
 
 function saveLane(lane, sessionId, cwd) {
+  let temporary = "";
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const lanes = loadLanes();
@@ -632,8 +803,16 @@ function saveLane(lane, sessionId, cwd) {
     const scope = laneScope(cwd);
     if (!lanes.scopes[scope] || typeof lanes.scopes[scope] !== "object") lanes.scopes[scope] = {};
     lanes.scopes[scope][lane] = { sessionId, at: Date.now() };
-    fs.writeFileSync(LANES_FILE, JSON.stringify(lanes, null, 2));
-  } catch {}
+    temporary = `${LANES_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(lanes, null, 2));
+    fs.renameSync(temporary, LANES_FILE);
+  } catch {
+    if (temporary) {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {}
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,9 +824,9 @@ function saveLane(lane, sessionId, cwd) {
 // a 600-line diff costs it a review.
 //
 // This runs a command the calling model supplied, which is a real step beyond
-// spawning a fixed CLI. The allowlist is the mitigation: only the first token is
-// matched, and only against commands you listed. Default covers the usual test
-// runners and nothing else.
+// spawning a fixed CLI. The allowlist constrains the entry executable, but it is
+// not a sandbox: npm scripts, npx and language runtimes can execute arbitrary
+// trusted repository code with this user's privileges.
 // ---------------------------------------------------------------------------
 
 const VERIFY_ALLOWLIST = (process.env.AGENT_BRIDGE_VERIFY_ALLOW || "npm,npx,pnpm,yarn,dotnet,pytest,python,go,cargo,make,mvn,gradle,jest,vitest,tsc,eslint")
@@ -655,9 +834,43 @@ const VERIFY_ALLOWLIST = (process.env.AGENT_BRIDGE_VERIFY_ALLOW || "npm,npx,pnpm
   .map((x) => x.trim())
   .filter(Boolean);
 
+function splitCommandLine(command) {
+  const parts = [];
+  let value = "";
+  let quote = "";
+  let started = false;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote) {
+      if (char === quote) quote = "";
+      else if (char === "\\" && quote === '"' && command[i + 1] === '"') {
+        value += '"';
+        i++;
+      } else value += char;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+      started = true;
+    } else if (/\s/.test(char)) {
+      if (started) {
+        parts.push(value);
+        value = "";
+        started = false;
+      }
+    } else {
+      value += char;
+      started = true;
+    }
+  }
+  if (quote) return { error: "verify skipped: command contains an unclosed quote" };
+  if (started) parts.push(value);
+  return { parts };
+}
+
 function runVerify(command, cwd) {
   return new Promise((resolve) => {
-    const parts = command.trim().split(/\s+/);
+    const parsed = splitCommandLine(command.trim());
+    if (parsed.error) return resolve({ ran: false, text: parsed.error });
+    const parts = parsed.parts;
     const head = path.basename(parts[0] || "").replace(/\.(exe|cmd|bat)$/i, "");
     if (!VERIFY_ALLOWLIST.includes(head)) {
       return resolve({ ran: false, text: `verify skipped: "${head}" is not in the allowlist (${VERIFY_ALLOWLIST.join(", ")})` });
@@ -671,7 +884,7 @@ function runVerify(command, cwd) {
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", ...parts] : parts.slice(1);
     const child = spawn(file, argv, { cwd: cwd || DEFAULT_CWD || process.cwd(), stdio: ["ignore", "pipe", "pipe"], detached: !IS_WINDOWS });
     trackChild(child);
-    let out = "";
+    const out = boundedBuffer(Math.min(MAX_PROCESS_OUTPUT_CHARS, 200_000), 0);
     let done = false;
     const finish = (v) => {
       if (done) return;
@@ -684,11 +897,11 @@ function runVerify(command, cwd) {
       killTree(child);
       finish({ ran: true, ok: false, text: `verify \`${command}\` timed out after 10 minutes` });
     }, 600_000);
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (out += d));
+    child.stdout.on("data", (d) => out.append(d));
+    child.stderr.on("data", (d) => out.append(d));
     child.on("error", (e) => finish({ ran: false, text: `verify could not start: ${e.message}` }));
     child.on("close", (code) => {
-      const tail = out.trim().split("\n").slice(-15).join("\n");
+      const tail = out.text().trim().split("\n").slice(-15).join("\n");
       finish({
         ran: true,
         ok: code === 0,
@@ -709,6 +922,15 @@ const jobs = new Map();
 let jobCounter = 0;
 const pendingJobs = [];
 const runningClaims = new Map();
+const runningLanes = new Set();
+const MAX_CONCURRENT_JOBS = positiveInt(process.env.AGENT_BRIDGE_MAX_CONCURRENT_JOBS, 4, 32);
+const MAX_JOBS_PER_CALL = positiveInt(process.env.AGENT_BRIDGE_MAX_JOBS_PER_CALL, 8, 64);
+const MAX_OUTSTANDING_JOBS = positiveInt(process.env.AGENT_BRIDGE_MAX_OUTSTANDING_JOBS, 64, 512);
+
+const claimPath = (base, file) => {
+  const resolved = path.resolve(base, file);
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved;
+};
 
 function claimsFor(spec) {
   const base = spec.cwd || DEFAULT_CWD || process.cwd();
@@ -724,7 +946,7 @@ function claimsFor(spec) {
     .map((x) => (x || "").trim())
     .filter(Boolean);
   if (!declared.length || declared.some((x) => x === "*" || /[*?\[\]]/.test(x))) return ["*"];
-  return declared.map((file) => path.resolve(base, file));
+  return declared.map((file) => claimPath(base, file));
 }
 
 function claimsOverlap(left, right) {
@@ -735,6 +957,8 @@ function claimsOverlap(left, right) {
 }
 
 function canStart(job) {
+  if (runningClaims.size >= MAX_CONCURRENT_JOBS) return false;
+  if (job.laneKey && runningLanes.has(job.laneKey)) return false;
   return ![...runningClaims.values()].some((claims) => claimsOverlap(job.claims, claims));
 }
 
@@ -742,21 +966,27 @@ function launchJob(job) {
   job.status = "running";
   job.startedAt = Date.now();
   runningClaims.set(job.id, job.claims);
-  (async () => {
-    try {
-      const r = await delegateToCodex(job.spec);
-      job.status = r.ok ? "done" : "failed";
-      job.text = r.text;
-    } catch (e) {
-      job.status = "failed";
-      job.text = `Codex job failed inside agent-bridge: ${e.message || e}`;
-    } finally {
-      job.seconds = Math.round((Date.now() - job.startedAt) / 1000);
-      runningClaims.delete(job.id);
-      job.resolve(job);
-      pumpQueue();
-    }
-  })();
+  if (job.laneKey) runningLanes.add(job.laneKey);
+  // A background job outlives the start_codex_jobs request by design. Detach it
+  // from that request's cancellation scope; host shutdown still kills it.
+  requestScope.run(undefined, () => {
+    (async () => {
+      try {
+        const r = await delegateToCodex(job.spec);
+        job.status = r.ok ? "done" : "failed";
+        job.text = r.text;
+      } catch (e) {
+        job.status = "failed";
+        job.text = `Codex job failed inside agent-bridge: ${e.message || e}`;
+      } finally {
+        job.seconds = Math.round((Date.now() - job.startedAt) / 1000);
+        runningClaims.delete(job.id);
+        if (job.laneKey) runningLanes.delete(job.laneKey);
+        job.resolve(job);
+        pumpQueue();
+      }
+    })();
+  });
 }
 
 function pumpQueue() {
@@ -773,10 +1003,20 @@ function pumpQueue() {
 }
 
 function enqueueJob(spec) {
+  validateLane(spec.lane);
   const id = `job-${++jobCounter}`;
   let resolve;
   const promise = new Promise((done) => (resolve = done));
-  const job = { id, task: spec.task.slice(0, 80), status: "queued", spec, claims: claimsFor(spec), promise, resolve };
+  const job = {
+    id,
+    task: spec.task.slice(0, 80),
+    status: "queued",
+    spec,
+    claims: claimsFor(spec),
+    laneKey: spec.lane ? `${laneScope(spec.cwd)}\0${spec.lane}` : "",
+    promise,
+    resolve,
+  };
   jobs.set(id, job);
   pendingJobs.push(job);
   pumpQueue();
@@ -852,7 +1092,8 @@ function usageFromAppServer() {
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", CODEX_BIN, ...args] : args;
     let child;
     try {
-      child = spawn(file, argv, { stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(file, argv, { stdio: ["pipe", "pipe", "ignore"], detached: !IS_WINDOWS });
+      trackChild(child);
     } catch {
       return resolve(null);
     }
@@ -865,12 +1106,15 @@ function usageFromAppServer() {
       try {
         killTree(child);
       } catch {}
+      untrackChild(child);
       resolve(v);
     };
     const timer = setTimeout(() => finish(null), 8000);
     child.on("error", () => finish(null));
+    child.on("close", () => finish(null));
     child.stdout.on("data", (d) => {
       out += d;
+      if (out.length > 200_000) return finish(null);
       let newline;
       while ((newline = out.indexOf("\n")) >= 0) {
         const line = out.slice(0, newline);
@@ -891,6 +1135,19 @@ function usageFromAppServer() {
       JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge", version: SERVER_VERSION } } }) + "\n"
     );
   });
+}
+
+function readTail(file, maximum = 2_000_000) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const length = Math.min(size, maximum);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, size - length);
+    return buffer.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Fall back to the newest rollout log that actually carries a rate_limits block. */
@@ -921,7 +1178,7 @@ function usageFromRollouts() {
   for (const f of files.slice(0, 5)) {
     let lines;
     try {
-      lines = fs.readFileSync(f.full, "utf8").split("\n");
+      lines = readTail(f.full).split("\n");
     } catch {
       continue;
     }
@@ -950,7 +1207,8 @@ let usageRefreshing = false;
 function refreshUsage(onDone) {
   if (usageRefreshing) return;
   usageRefreshing = true;
-  usageFromAppServer()
+  requestScope
+    .run(undefined, () => usageFromAppServer())
     .then((v) => v || usageFromRollouts())
     .catch(() => null)
     .then((value) => {
@@ -1114,6 +1372,8 @@ const TOOLS = [
       properties: {
         tasks: {
           type: "array",
+          minItems: 1,
+          maxItems: MAX_JOBS_PER_CALL,
           // Short descriptions here on purpose. The full field guidance is on
           // delegate_to_codex, and repeating all of it costs several hundred
           // tokens in every session for a reader who has already seen it.
@@ -1145,6 +1405,14 @@ const TOOLS = [
     },
     run: async ({ tasks }) => {
       if (!Array.isArray(tasks) || !tasks.length) throw new Error("tasks must be a non-empty array");
+      if (tasks.length > MAX_JOBS_PER_CALL) throw new Error(`at most ${MAX_JOBS_PER_CALL} jobs may be started in one call`);
+      if (jobs.size + tasks.length > MAX_OUTSTANDING_JOBS) {
+        throw new Error(`too many outstanding jobs; collect existing jobs before exceeding ${MAX_OUTSTANDING_JOBS}`);
+      }
+      for (const [index, task] of tasks.entries()) {
+        if (!task || typeof task.task !== "string" || !task.task.trim()) throw new Error(`tasks[${index}].task is required`);
+        validateLane(task.lane);
+      }
       const created = tasks.map(enqueueJob);
       const running = created.filter((j) => j.status === "running").length;
       const queued = created.length - running;
@@ -1176,10 +1444,13 @@ const TOOLS = [
       },
     },
     run: async ({ ids }) => {
-      const wanted = ids?.length ? ids.map((id) => jobs.get(id)).filter(Boolean) : [...jobs.values()].filter((j) => !j.collected);
+      if (ids !== undefined && !Array.isArray(ids)) throw new Error("ids must be an array");
+      const missing = ids?.filter((id) => !jobs.has(id)) || [];
+      if (missing.length) throw new Error(`unknown job id${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`);
+      const wanted = ids?.length ? ids.map((id) => jobs.get(id)) : [...jobs.values()];
       if (!wanted.length) return { ok: true, text: "No outstanding Codex jobs." };
       const settled = await Promise.all(wanted.map((j) => j.promise));
-      settled.forEach((j) => (j.collected = true));
+      settled.forEach((j) => jobs.delete(j.id));
       return {
         ok: settled.every((j) => j.status === "done"),
         text: settled.map((j) => `### ${j.id} (${j.status}, ${j.seconds}s) - ${j.task}\n${j.text}`).join("\n\n"),
@@ -1254,7 +1525,45 @@ const TOOLS = [
 // JSON-RPC loop
 // ---------------------------------------------------------------------------
 
+const PROTOCOL_META_KEY = "io.modelcontextprotocol/protocolVersion";
+const SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
+
+function requestProtocol(msg) {
+  return msg?.params?._meta?.[PROTOCOL_META_KEY] || "";
+}
+
+function isModernRequest(msg) {
+  return requestProtocol(msg) === MODERN_PROTOCOL_VERSION;
+}
+
+function modernizeResult(msg, result) {
+  if (!isModernRequest(msg) || !result || result.__error || msg.method === "initialize") return result;
+  const modern = {
+    resultType: "complete",
+    ...result,
+    _meta: { ...(result._meta || {}), [SERVER_INFO_META_KEY]: { name: "agent-bridge", version: SERVER_VERSION } },
+  };
+  if (msg.method === "tools/list") {
+    modern.ttlMs = 0;
+    modern.cacheScope = "private";
+  }
+  return modern;
+}
+
 async function handle(msg) {
+  if (!msg || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+    return { __error: { code: -32600, message: "invalid JSON-RPC request" } };
+  }
+  const protocol = requestProtocol(msg);
+  if (protocol && protocol !== MODERN_PROTOCOL_VERSION && !LEGACY_PROTOCOL_VERSIONS.includes(protocol)) {
+    return {
+      __error: {
+        code: -32022,
+        message: "Unsupported protocol version",
+        data: { supported: [MODERN_PROTOCOL_VERSION, ...LEGACY_PROTOCOL_VERSIONS], requested: protocol },
+      },
+    };
+  }
   if (msg.method === "notifications/cancelled") {
     cancelRequest(msg.params?.requestId);
     return null;
@@ -1263,11 +1572,24 @@ async function handle(msg) {
   if (msg.id === undefined) return null;
 
   switch (msg.method) {
+    case "server/discover":
+      return {
+        resultType: "complete",
+        supportedVersions: [MODERN_PROTOCOL_VERSION],
+        capabilities: { tools: { listChanged: false } },
+        instructions: "Use ask tools for read-only reviews and delegate/start tools for implementation work.",
+        ttlMs: 0,
+        cacheScope: "private",
+        _meta: { [SERVER_INFO_META_KEY]: { name: "agent-bridge", version: SERVER_VERSION } },
+      };
+
     case "initialize":
       return {
-        // Echo the client's protocol version back when it sends one. Hosts are
-        // on different release cadences and this avoids arguing about it.
-        protocolVersion: msg.params?.protocolVersion || "2025-06-18",
+        // Legacy MCP negotiates by echoing a supported client version, otherwise
+        // selecting one the server implements. Never claim an arbitrary version.
+        protocolVersion: LEGACY_PROTOCOL_VERSIONS.includes(msg.params?.protocolVersion)
+          ? msg.params.protocolVersion
+          : LEGACY_PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: true } },
         serverInfo: { name: "agent-bridge", version: SERVER_VERSION },
       };
@@ -1410,24 +1732,33 @@ async function handle(msg) {
 let notifyToolsChanged = () => {};
 
 function startStdio() {
+  let modernClient = false;
   createInterface({ input: process.stdin }).on("line", async (line) => {
     if (!line.trim()) return;
     let msg;
     try {
       msg = JSON.parse(line);
     } catch {
-      return log("ignored unparseable line");
+      log("rejected unparseable JSON-RPC line");
+      return send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
     }
     try {
-      const result = await requestScope.run(msg.id, () => handle(msg));
+      if (isModernRequest(msg)) modernClient = true;
+      const result = modernizeResult(msg, await requestScope.run(msg.id, () => handle(msg)));
       if (result === null) return;
-      if (result.__error) return send({ jsonrpc: "2.0", id: msg.id, error: result.__error });
+      if (result.__error) return send({ jsonrpc: "2.0", id: msg.id ?? null, error: result.__error });
       send({ jsonrpc: "2.0", id: msg.id, result });
     } catch (e) {
-      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e.message || e) } });
+      send({ jsonrpc: "2.0", id: msg?.id ?? null, error: { code: -32603, message: String(e.message || e) } });
+    } finally {
+      clearRequest(msg?.id);
     }
   });
-  notifyToolsChanged = () => send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+  // Modern MCP delivers list changes only through an opted-in subscription.
+  // This bridge has no subscription stream, and its modern tools/list TTL is 0.
+  notifyToolsChanged = () => {
+    if (!modernClient) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+  };
 }
 
 function startHttp() {
@@ -1442,10 +1773,33 @@ function startHttp() {
   const expectedPath = `/mcp/${REMOTE_SECRET}`;
 
   const server = http.createServer(async (req, res) => {
+    let completed = false;
+    const requestToken = Symbol("http-request");
     const reply = (code, body) => {
-      res.writeHead(code, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
+      if (completed || res.writableEnded) return;
+      completed = true;
+      if (body === undefined) {
+        res.writeHead(code);
+        res.end();
+      } else {
+        res.writeHead(code, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      }
     };
+    res.on("close", () => {
+      // Modern Streamable HTTP defines a closed response stream as cancellation.
+      // A unique token avoids collisions when two clients reuse JSON-RPC id 1.
+      if (!completed) cancelRequest(requestToken);
+    });
+    req.socket.on("close", () => {
+      if (!completed) cancelRequest(requestToken);
+    });
+
+    const origin = req.headers.origin;
+    if (origin && !HTTP_ALLOWED_ORIGINS.has(origin)) {
+      log("rejected request with disallowed Origin");
+      return reply(403, { jsonrpc: "2.0", error: { code: -32000, message: "origin not allowed" } });
+    }
 
     // timingSafeEqual so the comparison does not leak the secret one character
     // at a time to anyone willing to measure. Lengths must match first.
@@ -1453,30 +1807,71 @@ function startHttp() {
     const want = Buffer.from(expectedPath);
     const pathOk = given.length === want.length && crypto.timingSafeEqual(given, want);
     if (!pathOk) {
-      log(`rejected request to ${(req.url || "").slice(0, 40)}`);
+      log("rejected request with invalid capability URL");
       return reply(404, { error: "not found" });
     }
     if (req.method !== "POST") return reply(405, { error: "use POST" });
 
-    let body = "";
+    const chunks = [];
+    let bodyBytes = 0;
+    let tooLarge = false;
     req.on("data", (d) => {
-      body += d;
-      if (body.length > 1_000_000) req.destroy(); // no reason for a huge request here
+      bodyBytes += d.length;
+      if (bodyBytes > 1_000_000) tooLarge = true;
+      else chunks.push(d);
     });
     req.on("end", async () => {
+      if (tooLarge) {
+        return reply(413, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "request body too large" } });
+      }
       let msg;
       try {
-        msg = JSON.parse(body);
+        msg = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch {
         return reply(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
       }
+
+      const protocol = requestProtocol(msg);
+      const protocolHeader = req.headers["mcp-protocol-version"];
+      const methodHeader = req.headers["mcp-method"];
+      const nameHeader = req.headers["mcp-name"];
+      if (protocol === MODERN_PROTOCOL_VERSION || protocolHeader === MODERN_PROTOCOL_VERSION) {
+        const decodeHeader = (value) => {
+          if (typeof value !== "string") return null;
+          const encoded = /^=\?base64\?([A-Za-z0-9+/]*={0,2})\?=$/.exec(value);
+          if (!encoded) return value;
+          try {
+            return Buffer.from(encoded[1], "base64").toString("utf8");
+          } catch {
+            return null;
+          }
+        };
+        const expectedName = msg.method === "tools/call" ? msg.params?.name : undefined;
+        const mismatch =
+          protocolHeader !== protocol ||
+          methodHeader !== msg.method ||
+          (expectedName !== undefined && decodeHeader(nameHeader) !== expectedName);
+        if (mismatch) {
+          return reply(400, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32020, message: "required MCP headers do not match the request body" },
+          });
+        }
+      }
+
       try {
-        const result = await requestScope.run(msg.id, () => handle(msg));
-        if (result === null) return reply(202, {});
-        if (result.__error) return reply(200, { jsonrpc: "2.0", id: msg.id, error: result.__error });
+        const result = modernizeResult(msg, await requestScope.run(requestToken, () => handle(msg)));
+        if (result === null) return reply(202);
+        if (result.__error) {
+          const status = result.__error.code === -32022 ? 400 : isModernRequest(msg) && result.__error.code === -32601 ? 404 : 200;
+          return reply(status, { jsonrpc: "2.0", id: msg.id, error: result.__error });
+        }
         reply(200, { jsonrpc: "2.0", id: msg.id, result });
       } catch (e) {
         reply(200, { jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e.message || e) } });
+      } finally {
+        clearRequest(requestToken);
       }
     });
   });
@@ -1485,8 +1880,9 @@ function startHttp() {
   // tunnel you set up on purpose is a much smaller mistake than a port you left
   // open on a hotel wifi without noticing.
   server.listen(REMOTE_PORT, REMOTE_HOST, () => {
-    log(`http listening on ${REMOTE_HOST}:${REMOTE_PORT}${expectedPath}`);
+    log(`http listening on ${REMOTE_HOST}:${REMOTE_PORT}/mcp/[redacted]`);
     log(`remote writes: ${REMOTE_WRITES ? "ENABLED" : "disabled (delegations run read-only)"}`);
+    log(`browser origins: ${HTTP_ALLOWED_ORIGINS.size ? [...HTTP_ALLOWED_ORIGINS].join(", ") : "none allowed"}`);
   });
 }
 

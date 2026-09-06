@@ -1,5 +1,8 @@
 # Agent Bridge 0.9.6 — Codex handoff pack
 
+> Historical 0.9.6 handoff. The completed return review is in
+> `CODEX_REVIEW.md`; Claude should begin with `START_HERE_CLAUDE.md`.
+
 ## Purpose
 
 This is the return leg of the review that produced 0.9.1. Codex reviewed Claude's

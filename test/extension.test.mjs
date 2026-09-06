@@ -90,5 +90,23 @@ test("the VS Code provider creates a positional stdio server definition", () => 
   assert.ok(Array.isArray(definition.argsReceived[2]));
   assert.equal(definition.argsReceived[4], "0.9.1");
 
+  // Removing Agent Bridge must never recursively delete a user's skill that
+  // happens to use the legacy generic directory name.
+  const legacy = module.exports._test.legacySkillPath();
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, "user-authored skill\n");
+  module.exports._test.removeManagedSkill(legacy);
+  assert.equal(fs.readFileSync(legacy, "utf8"), "user-authored skill\n");
+
+  fs.writeFileSync(legacy, "<!-- managed-by-agent-bridge -->\nset_project_context\nstart_codex_jobs\n");
+  fs.writeFileSync(path.join(path.dirname(legacy), "keep.txt"), "mine\n");
+  module.exports._test.removeManagedSkill(legacy);
+  assert.equal(fs.existsSync(legacy), false);
+  assert.equal(fs.readFileSync(path.join(path.dirname(legacy), "keep.txt"), "utf8"), "mine\n");
+
+  module.exports._test.writeManagedSkill();
+  const managed = module.exports._test.skillPath();
+  assert.match(fs.readFileSync(managed, "utf8"), /managed-by-agent-bridge/);
+
   for (const item of disposables) item?.dispose?.();
 });

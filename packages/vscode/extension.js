@@ -44,11 +44,16 @@ const STATE_DIR = path.join(os.homedir(), ".agent-bridge");
 function serverPath(context) {
   const bundled = path.join(context.extensionPath, "server", "agent-bridge.mjs");
   const stable = path.join(STATE_DIR, "agent-bridge.mjs");
+  const temporary = `${stable}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.copyFileSync(bundled, stable);
+    fs.copyFileSync(bundled, temporary);
+    fs.renameSync(temporary, stable);
     return stable;
   } catch {
+    try {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    } catch {}
     // If the copy fails, running from the extension folder is better than not
     // running at all. VS Code will still work; the CLIs may break on update.
     return bundled;
@@ -68,7 +73,7 @@ function syncSettings() {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const file = path.join(STATE_DIR, "settings.json");
-    const temporary = `${file}.tmp`;
+    const temporary = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(temporary, JSON.stringify(settings, null, 2));
     fs.renameSync(temporary, file);
   } catch {}
@@ -84,9 +89,11 @@ function syncSettings() {
  * instead of costing context every session.
  */
 const SKILL = `---
-name: delegating-to-codex
+name: agent-bridge-delegating-to-codex
 description: How to split work with OpenAI Codex - you design, Codex builds. Use whenever the agent-bridge tools (delegate_to_codex, start_codex_jobs) are available and there is implementation work to do, or when the user asks to push work to Codex or save Claude usage.
 ---
+
+<!-- managed-by-agent-bridge -->
 
 ## The split
 
@@ -151,9 +158,10 @@ Use \`delegate_to_codex\` when you need the one thing before you can continue.
 
 ## After every handoff
 
-Read the verdict first. If verify passed and the diff stat looks like the change
+Read the verdict first. If verify passed and the working-tree observations look like the change
 you asked for, move on. If there was no verify command, read the diff, and next
-time give one. An empty diff stat means nothing was written, whatever the summary
+time give one. Verification runs trusted repository code with your user privileges;
+the executable allowlist is not a security sandbox. An empty working-tree report means nothing was written, whatever the summary
 says. Do not loop more than twice on one task; rewrite the spec or do it yourself.
 
 ## Tell the user
@@ -162,7 +170,47 @@ One line before delegating: what you are handing off, what you are keeping. They
 should be able to stop you.
 `;
 
-const skillPath = () => path.join(os.homedir(), ".claude", "skills", "delegating-to-codex", "SKILL.md");
+const skillPath = () => path.join(os.homedir(), ".claude", "skills", "agent-bridge-delegating-to-codex", "SKILL.md");
+const legacySkillPath = () => path.join(os.homedir(), ".claude", "skills", "delegating-to-codex", "SKILL.md");
+
+function isManagedSkill(file) {
+  try {
+    const text = fs.readFileSync(file, "utf8");
+    return (
+      text.includes("managed-by-agent-bridge") ||
+      (text.includes("How to split work with OpenAI Codex - you design, Codex builds") &&
+        text.includes("set_project_context") &&
+        text.includes("start_codex_jobs"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function removeManagedSkill(file) {
+  if (!isManagedSkill(file)) return;
+  try {
+    fs.unlinkSync(file);
+    fs.rmdirSync(path.dirname(file)); // succeeds only when no user files remain
+  } catch {}
+}
+
+function writeManagedSkill() {
+  const file = skillPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, SKILL);
+    fs.renameSync(temporary, file);
+    // 0.9.6 and earlier used a generic directory name. Remove it only when it
+    // has the Agent Bridge signature; never recursively delete a user's skill.
+    removeManagedSkill(legacySkillPath());
+  } finally {
+    try {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    } catch {}
+  }
+}
 
 /** Config values, resolved fresh each time so changing a setting takes effect. */
 function env() {
@@ -204,9 +252,8 @@ function applyToClis(context, enable) {
   for (const host of hosts) {
     if (!cliInstalled(host.bin)) {
       if (!enable && host.label === "Claude Code") {
-        try {
-          fs.rmSync(path.dirname(skillPath()), { recursive: true, force: true });
-        } catch {}
+        removeManagedSkill(skillPath());
+        removeManagedSkill(legacySkillPath());
       }
       skipped.push(host.label);
       continue;
@@ -221,11 +268,10 @@ function applyToClis(context, enable) {
     // means it rarely does.
     if (host.label === "Claude Code" && (!enable || r.ok)) {
       try {
-        if (enable) {
-          fs.mkdirSync(path.dirname(skillPath()), { recursive: true });
-          fs.writeFileSync(skillPath(), SKILL);
-        } else if (fs.existsSync(skillPath())) {
-          fs.rmSync(path.dirname(skillPath()), { recursive: true, force: true });
+        if (enable) writeManagedSkill();
+        else {
+          removeManagedSkill(skillPath());
+          removeManagedSkill(legacySkillPath());
         }
       } catch {}
     }
@@ -401,4 +447,8 @@ function activate(context) {
 // leaving an entry you can remove with one command.
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  _test: { isManagedSkill, removeManagedSkill, writeManagedSkill, skillPath, legacySkillPath },
+};

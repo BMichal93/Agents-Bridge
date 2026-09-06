@@ -1,0 +1,61 @@
+Agent Bridge 0.9.8 - Claude validation record
+================================================
+
+Review completed: 2026-09-06
+Codex baseline:   f311cadac9141ab46e7bf7ece4df9baa445d3a1a
+Claude response:  9907907a9d397cb91c92cb019740a65d77a3cf86
+Environment: Linux, Node v22.22.2
+
+REPRODUCTION OF THE CODEX 0.9.7 GATE
+
+PASS  Pack integrity
+      All six SHA-256 hashes in the incoming pack verified. Source ZIP unpacked
+      with complete inherited history and a clean working tree.
+
+PASS  npm run check      (on 0.9.7, before any change)
+PASS  npm test           47 passed, 0 failed. Matches the Codex record.
+PASS  npm run budget     2.9x, ~40,979 tokens saved. Matches the Codex record.
+PASS  npm run doctor -- --no-live
+                         1 passed, 0 failed, 2 skipped. Matches.
+PASS  npm run build      both installers, versions reported 0.9.7.
+
+INDEPENDENT VERIFICATION OF REVIEW CLAIMS
+
+PASS  claude --restricted / --bare exist and carry the documented isolation.
+PASS  MCP 2026-07-28 server/discover is mandatory for servers; the implemented
+      result shape matches the specification example field for field.
+PASS  Claude Code documents that --help does not list every flag, confirming the
+      doctor change from authoritative to advisory help checks.
+
+VALIDATION OF 0.9.8
+
+PASS  npm run check
+PASS  npm test           49 passed, 0 failed, 0 skipped.
+                         Adds two regression tests for guarantee-versus-hygiene
+                         flag rejection, including an assertion that the
+                         unrestricted fallback never runs.
+PASS  npm run budget     2.9x on defaults; still reports a loss on small tasks.
+PASS  npm run doctor -- --no-live
+                         1 passed, 0 failed, 2 skipped.
+PASS  npm run build      agent-bridge-0.9.8.mcpb and agent-bridge-0.9.8.vsix.
+PASS  installer integrity
+                         Both archives list their manifest reporting 0.9.8, and
+                         both embedded agent-bridge.mjs files are byte-identical
+                         to src/agent-bridge.mjs.
+PASS  source integrity   Clean tree at packaging time; ZIP includes .git.
+
+Reviewed server SHA-256:
+  ef14d36842e403e7d487688a93c95b23987682bdb18cba18d1dd19d3ce77d638
+
+NOT PROVEN IN THIS ENVIRONMENT
+
+- A live authenticated codex exec read-only call.
+- A live authenticated Claude Code restricted/bare call, including whether
+  rejectedFlag() matches real CLI error wording.
+- A real write delegation and a real codex exec resume lane.
+- Windows .cmd spawning, case-insensitive claims and process-tree cancellation.
+- Line-by-line review of the 576-line 0.9.7 server diff; protocol shapes and
+  flag claims were verified, the surrounding implementation was exercised only
+  through the test suite.
+
+Neither reviewer has run an authenticated CLI against this code at any point.

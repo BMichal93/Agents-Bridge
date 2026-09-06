@@ -1,61 +1,47 @@
-Agent Bridge 0.9.8 - Claude validation record
-================================================
+Agent Bridge 0.9.9 — Codex validation record
+Review date: 2026-09-06
+Input: agent-bridge-0.9.8-codex-review-pack.zip
+Input source head: 6f373b0 (behavioral change 50403aa)
+Environment: Linux, Node v24.19.0, npm 11.9.0
 
-Review completed: 2026-09-06
-Codex baseline:   f311cadac9141ab46e7bf7ece4df9baa445d3a1a
-Claude response:  9907907a9d397cb91c92cb019740a65d77a3cf86
-Environment: Linux, Node v22.22.2
+BASELINE
+PASS: all six incoming pack SHA-256 checksums.
+PASS: clean inherited Git repository with history.
+PASS: npm test on unchanged 0.9.8 — 49 passed, 0 failed.
 
-REPRODUCTION OF THE CODEX 0.9.7 GATE
+FINAL GATES
+PASS: npm run check — server, extension and doctor syntax.
+PASS: npm test — 69 passed, 0 failed, 0 skipped; about 25.3 seconds.
+      Includes 20 new regression tests in test/review-099.test.mjs.
+PASS: npm run budget — every scenario must now succeed, including real
+      node --version verification and stub JSONL lane resume.
+      Tool definitions: 9,573 characters; returned results: 2,248 characters.
+      Combined: 11,821 characters (~2,955 tokens by the script's estimate).
+      Default five-task estimate: ~40,995 caller-context tokens saved, 2.9x.
+      These are synthetic scenario estimates, NOT total billing or live usage.
+PASS: small-task budget scenario reports a loss; covered by the test suite.
+PASS: npm run doctor -- --no-live — 1 passed, 0 failed, 2 skipped.
+      Node passed. Codex and Claude were absent and explicitly skipped.
+PASS: npm run build — both 0.9.9 installers rebuilt successfully.
+PASS: unzip -t on MCPB and VSIX.
+PASS: both embedded server files are byte-identical to src/agent-bridge.mjs.
+PASS: MCPB and VSIX package manifests both report 0.9.9.
+PASS: git diff --check.
 
-PASS  Pack integrity
-      All six SHA-256 hashes in the incoming pack verified. Source ZIP unpacked
-      with complete inherited history and a clean working tree.
+SERVER / INSTALLER SHA-256
+b498c7380d1319da4befffa650b7cf37674279690531eee836ec03ca2d6cb69f  src/agent-bridge.mjs
+a191d3fec6880474a4df46cefac0c639dfa706433e2ecae681ff21b4d0dda691  agent-bridge-0.9.9.mcpb
+e6aa67f7e149108c932a3fe7dbe5e3af7321427cc7ea4a2d0077a13dad3e8185  agent-bridge-0.9.9.vsix
 
-PASS  npm run check      (on 0.9.7, before any change)
-PASS  npm test           47 passed, 0 failed. Matches the Codex record.
-PASS  npm run budget     2.9x, ~40,979 tokens saved. Matches the Codex record.
-PASS  npm run doctor -- --no-live
-                         1 passed, 0 failed, 2 skipped. Matches.
-PASS  npm run build      both installers, versions reported 0.9.7.
+EVIDENCE BOUNDARIES
+- No authenticated Codex or Claude model call was executed.
+- The doctor fallback test uses a stub CLI; it is NOT a live compatibility pass.
+- No Windows execution or interactive Claude Desktop / VS Code install was done.
+- No repository was pushed and no release was published.
+- Claims are process-local and verification is trusted host execution.
+- Read-only workspace behavior is not a guarantee of no local metadata writes
+  or of overriding every managed/project configuration layer.
 
-INDEPENDENT VERIFICATION OF REVIEW CLAIMS
-
-PASS  claude --restricted / --bare exist and carry the documented isolation.
-PASS  MCP 2026-07-28 server/discover is mandatory for servers; the implemented
-      result shape matches the specification example field for field.
-PASS  Claude Code documents that --help does not list every flag, confirming the
-      doctor change from authoritative to advisory help checks.
-
-VALIDATION OF 0.9.8
-
-PASS  npm run check
-PASS  npm test           49 passed, 0 failed, 0 skipped.
-                         Adds two regression tests for guarantee-versus-hygiene
-                         flag rejection, including an assertion that the
-                         unrestricted fallback never runs.
-PASS  npm run budget     2.9x on defaults; still reports a loss on small tasks.
-PASS  npm run doctor -- --no-live
-                         1 passed, 0 failed, 2 skipped.
-PASS  npm run build      agent-bridge-0.9.8.mcpb and agent-bridge-0.9.8.vsix.
-PASS  installer integrity
-                         Both archives list their manifest reporting 0.9.8, and
-                         both embedded agent-bridge.mjs files are byte-identical
-                         to src/agent-bridge.mjs.
-PASS  source integrity   Clean tree at packaging time; ZIP includes .git.
-
-Reviewed server SHA-256:
-  ef14d36842e403e7d487688a93c95b23987682bdb18cba18d1dd19d3ce77d638
-
-NOT PROVEN IN THIS ENVIRONMENT
-
-- A live authenticated codex exec read-only call.
-- A live authenticated Claude Code restricted/bare call, including whether
-  rejectedFlag() matches real CLI error wording.
-- A real write delegation and a real codex exec resume lane.
-- Windows .cmd spawning, case-insensitive claims and process-tree cancellation.
-- Line-by-line review of the 576-line 0.9.7 server diff; protocol shapes and
-  flag claims were verified, the surrounding implementation was exercised only
-  through the test suite.
-
-Neither reviewer has run an authenticated CLI against this code at any point.
+Read CODEX_REVIEW_0.9.9.md for feedback and LIVE_SMOKE_TESTS.md for the exact
+next-machine gate. The release candidate must not be described as live-certified.
+The outer pack SHA256SUMS additionally covers source, docs, and this record.

@@ -355,7 +355,7 @@ test("HTTP mode refuses to start without a strong secret", async () => {
   assert.notEqual(r.status, 0);
 });
 
-test("HTTP mode rejects a wrong secret and serves the right one", async () => {
+test("HTTP mode rejects a wrong secret and serves the right one", async (t) => {
   const { spawn } = await import("node:child_process");
   const { SERVER } = await import("./helpers.mjs");
   const crypto = await import("node:crypto");
@@ -375,6 +375,7 @@ test("HTTP mode rejects a wrong secret and serves the right one", async () => {
     stdio: ["ignore", "ignore", "pipe"],
   });
   let serverErr = "";
+  t.after(() => srv.kill());
   srv.stderr.on("data", (chunk) => (serverErr += chunk));
   await wait(1200);
 

@@ -57,12 +57,14 @@ const stubJs = path.join(bin, "codex.stub.mjs");
 fs.writeFileSync(
   stubJs,
   `import fs from "node:fs";
+if (process.argv.includes("app-server")) process.exit(0);
 const chunks = [];
 process.stdin.on("data", (d) => chunks.push(d));
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(path.join(repo, "Generated.cs"))}, "x\\n".repeat(${LINES_WRITTEN}));
   // Codex prints a short final message; the narration goes to stderr.
-  console.log("Implemented the requested change across 3 files and added tests.");
+  console.log(JSON.stringify({type:"thread.started",thread_id:"0199a213-81c0-7800-8aa1-bbab2a035a53"}));
+  console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented the requested change across 3 files and added tests."}}));
 });
 `
 );
@@ -81,6 +83,9 @@ const proc = spawn(process.execPath, [SERVER], {
     USERPROFILE: home,
     AGENT_BRIDGE_CODEX_BIN: path.join(bin, process.platform === "win32" ? "codex.cmd" : "codex"),
     AGENT_BRIDGE_DEFAULT_CWD: repo,
+    // This synthetic scenario asks for node --version, so permit that command
+    // explicitly. Previously both supposedly verified delegations skipped it.
+    AGENT_BRIDGE_VERIFY_ALLOW: "node",
   },
   stdio: ["pipe", "pipe", "ignore"],
 });
@@ -116,6 +121,10 @@ async function measure(label, name, args) {
   // The handoff Claude writes is a real cost on the delegated side.
   specBytes += JSON.stringify(args).length;
   const res = await send("tools/call", { name, arguments: args });
+  if (res.error || res.result?.isError) {
+    proc.kill();
+    throw new Error(`Budget scenario ${label} failed: ${JSON.stringify(res)}`);
+  }
   const text = res.result?.content?.map((c) => c.text).join("\n") ?? JSON.stringify(res.error);
   measured.push({ label, bytes: text.length });
   return text;

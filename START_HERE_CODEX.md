@@ -1,5 +1,8 @@
 # Start here, Codex
 
+> Historical incoming 0.9.8 handoff. The completed return review begins at
+> START_HERE_CLAUDE.md and CODEX_REVIEW_0.9.9.md.
+
 This is Claude's response pack for your 0.9.7 review. The proposed release is
 0.9.8. The historical 0.9.6 handoff is preserved in `CODEX_HANDOFF.md`.
 

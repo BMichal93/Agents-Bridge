@@ -13,6 +13,9 @@ scripts/build.mjs           copies src/ into both packages and packs them
 test/                       node:test suite, drives the real server over stdio
 ```
 
+Start the current return review from `START_HERE_CLAUDE.md` and
+`CODEX_REVIEW_0.9.9.md`. Earlier reviews/responses are preserved as history.
+
 `src/agent-bridge.mjs` is the only server copy that gets edited. The build copies it into
 each package; those copies are gitignored. If you find yourself editing a file
 under `packages/*/server/`, stop, that change will be overwritten.
@@ -49,15 +52,15 @@ check.
 
 **CLI flags drift.** Both Codex and Claude Code change flags between releases.
 Claude explicitly documents that `claude --help` omits some flags, so help is an
-advisory, not a compatibility test. Run `npm run doctor`: its live probes use the
-same argument arrays as the bridge. Codex calls request JSONL with `--json`;
+advisory, not a compatibility test. Run `npm run doctor`: its Claude probe calls
+the actual MCP tool (including fallback); Codex probes the baseline argv. Codex calls request JSONL with `--json`;
 `thread.started` supplies the lane session ID and the last completed
 `agent_message` supplies returned text. Keep the plain-text fallback for old
 releases and test doubles.
 
 **Read-only means configuration isolation too.** `ask_codex` combines a read-only
-sandbox with `--ephemeral --ignore-user-config --ignore-rules`, so user MCP and
-execpolicy configuration cannot add side effects. `ask_claude` combines
+sandbox with `--ephemeral --ignore-user-config --ignore-rules`. These are not a
+universal external-tool sandbox or a managed-policy override. `ask_claude` combines
 `--restricted --bare --no-session-persistence` with an explicit read-only tool
 list and MCP denial. Do not weaken one layer because another appears redundant.
 Restricted mode requires Claude Code 2.1.248 or newer.
@@ -122,6 +125,24 @@ one, the call fails loudly and is never retried without it, because a silent
 retry would leave the tool looking read-only while it was not. Everything in
 `CLAUDE_OPTIONAL_FLAGS` is hygiene and is dropped on rejection with a note in the
 reply.
+
+Only an anchored parser error on stderr with exit 1/2 and no stdout qualifies
+for the one optional retry. Do not infer rejection from an answer quoting an
+error, or retry after a signal/timeout. Both attempts share one time budget.
+Dropping persistence hygiene may retain sensitive prompts locally; document it.
+
+## 0.9.9 regression invariants
+
+- Parse JSON-RPC envelopes before accessing fields; malformed HTTP bodies must
+  return errors without killing the server. Validate job batches before launch.
+- Track active cancellation scopes only, clean up HTTP keep-alive listeners,
+  and preserve background results when collection is cancelled.
+- Parse Codex JSONL incrementally, before output trimming. Errors survive noisy
+  streams; oversized events and absent final messages fail explicitly.
+- Git porcelain v2 paths resolve from the repository root; include index object
+  IDs and modes. Take the final snapshot after verification.
+- A requested verification that never ran is not success. Do not launch verify
+  after a failed/cancelled peer or when remote writes are disabled.
 
 `--no-session-persistence` is in the optional set for a reason: it has been
 removed from the CLI at least once and shipped as a no-op in another release,

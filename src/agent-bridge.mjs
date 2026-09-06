@@ -30,9 +30,10 @@ import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { StringDecoder } from "node:string_decoder";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.8";
+const SERVER_VERSION = "0.9.9";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -56,8 +57,9 @@ const MAX_REPLY_CHARS = Number(process.env.AGENT_BRIDGE_MAX_REPLY_CHARS) || 6000
 // host process before MAX_REPLY_CHARS gets a chance to trim the answer.
 const MAX_PROCESS_OUTPUT_CHARS = positiveInt(process.env.AGENT_BRIDGE_MAX_PROCESS_OUTPUT_CHARS, 1_000_000, 10_000_000);
 
-// Neither CLI is told which model to use unless you say so here, so by default
-// each one uses whatever its own config already selects. Setting these lets you
+// Neither CLI is told which model to use unless you say so here. Read-only
+// calls isolate user configuration and may therefore use built-in defaults.
+// Setting these lets you
 // point delegated work at a cheaper or faster model than the one you drive
 // interactively, which is usually the point of delegating in the first place.
 const CODEX_MODEL = process.env.AGENT_BRIDGE_CODEX_MODEL || "";
@@ -154,7 +156,7 @@ function resolveEffort(peer, effort) {
 // HTTP mode, off unless asked for. See startHttp for why the defaults are strict.
 const REMOTE_MODE = process.argv.includes("--http") || process.env.AGENT_BRIDGE_HTTP === "1";
 const REMOTE_SECRET = process.env.AGENT_BRIDGE_REMOTE_SECRET || "";
-const REMOTE_PORT = Number(process.env.AGENT_BRIDGE_HTTP_PORT) || 7333;
+const REMOTE_PORT = process.env.AGENT_BRIDGE_HTTP_PORT === "0" ? 0 : Number(process.env.AGENT_BRIDGE_HTTP_PORT) || 7333;
 const REMOTE_HOST = process.env.AGENT_BRIDGE_HTTP_HOST || "127.0.0.1";
 const REMOTE_WRITES = process.env.AGENT_BRIDGE_REMOTE_WRITES === "1";
 const HTTP_ALLOWED_ORIGINS = new Set(
@@ -218,6 +220,8 @@ const liveChildren = new Set();
 const requestScope = new AsyncLocalStorage();
 const requestChildren = new Map();
 const cancelledRequests = new Set();
+const activeRequests = new Set();
+const requestCancelled = () => cancelledRequests.has(requestScope.getStore());
 
 function trackChild(child) {
   liveChildren.add(child);
@@ -240,7 +244,9 @@ function untrackChild(child) {
 }
 
 function cancelRequest(requestId) {
-  if (requestId === undefined) return;
+  // Ignore unknown/already-finished IDs; cancellation notifications must not
+  // retain arbitrary IDs forever or poison a later request using the same ID.
+  if (requestId === undefined || !activeRequests.has(requestId)) return;
   cancelledRequests.add(requestId);
   const children = requestChildren.get(requestId) || [];
   for (const child of children) {
@@ -253,6 +259,7 @@ function cancelRequest(requestId) {
 
 function clearRequest(requestId) {
   if (requestId === undefined) return;
+  activeRequests.delete(requestId);
   requestChildren.delete(requestId);
   cancelledRequests.delete(requestId);
 }
@@ -302,39 +309,61 @@ process.stdin.on("close", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-function parseCodexJsonLines(output) {
-  const messages = [];
-  const errors = [];
+function codexEventCapture() {
+  const fallback = boundedBuffer(MAX_PROCESS_OUTPUT_CHARS);
+  const errors = boundedBuffer(Math.min(MAX_PROCESS_OUTPUT_CHARS, 20_000), 0);
+  let answer = "";
+  let pending = "";
+  let droppingLine = false;
   let sessionId = null;
   let sawJsonEvent = false;
   let failed = false;
-
-  for (const line of output.split("\n")) {
-    if (!line.trim()) continue;
+  const eventLine = (line) => {
+    if (!line.trim()) return;
     try {
       const event = JSON.parse(line);
-      if (!event || typeof event.type !== "string") continue;
+      if (!event || typeof event.type !== "string") return;
       sawJsonEvent = true;
       if (event.type === "thread.started" && typeof event.thread_id === "string") sessionId = event.thread_id;
       if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
-        messages.push(event.item.text);
+        answer = event.item.text;
       }
       if (event.type === "turn.failed" || event.type === "error") {
         failed = true;
         const detail = event.error?.message || event.message || event.error;
-        if (detail) errors.push(typeof detail === "string" ? detail : JSON.stringify(detail));
+        if (detail) errors.append((typeof detail === "string" ? detail : JSON.stringify(detail)) + "\n");
       }
     } catch {
       // Older Codex releases and test doubles may still emit plain text.
     }
-  }
-
-  if (!sawJsonEvent) return { text: output.trim(), sessionId: null, failed: false, errors: "" };
+  };
   return {
-    text: messages.at(-1)?.trim() || errors.join("\n") || "(Codex returned no final message)",
-    sessionId,
-    failed,
-    errors: errors.join("\n"),
+    append(chunk) {
+      fallback.append(chunk);
+      for (const [index, part] of chunk.split("\n").entries()) {
+        if (index) {
+          if (!droppingLine) eventLine(pending);
+          pending = "";
+          droppingLine = false;
+        }
+        if (droppingLine) continue;
+        if (pending.length + part.length > MAX_PROCESS_OUTPUT_CHARS) {
+          // Cannot safely classify a truncated JSON event. Fail closed instead
+          // of pretending it was progress and potentially dropping an error.
+          failed = true;
+          errors.append("Codex event exceeded the process-output limit.\n");
+          pending = "";
+          droppingLine = true;
+        } else pending += part;
+      }
+    },
+    result() {
+      if (!droppingLine) eventLine(pending);
+      if (!sawJsonEvent && !failed) return { text: fallback.text().trim(), sessionId: null, failed: false, errors: "" };
+      if (!answer.trim() && !failed) errors.append("Codex returned no final message.\n");
+      return { text: answer.trim() || errors.text().trim(), sessionId,
+        failed: failed || !answer.trim(), errors: errors.text().trim() };
+    },
   };
 }
 
@@ -365,6 +394,7 @@ function boundedBuffer(limit, headRatio = 0.25) {
 
 function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {}) {
   return new Promise((resolve) => {
+    if (shuttingDown || requestCancelled()) return resolve({ ok: false, text: "Agent call cancelled before starting." });
     if (IS_WINDOWS && [bin, ...args].some((value) => !safeForWindowsCmd(value))) {
       return resolve({ ok: false, text: "(refused command containing Windows shell metacharacters)" });
     }
@@ -382,10 +412,13 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
 
     trackChild(child);
 
-    // Keep the start of stdout for Codex's thread.started event and the end for
-    // its final agent_message. Stderr only needs its diagnostic tail.
-    const out = boundedBuffer(MAX_PROCESS_OUTPUT_CHARS, 0.25);
+    // Parse Codex events incrementally so trimming cannot erase a failure.
+    // Plain-text peers keep head/tail output; stderr keeps its diagnostic tail.
+    const out = codexJson ? codexEventCapture() : boundedBuffer(MAX_PROCESS_OUTPUT_CHARS, 0.25);
     const err = boundedBuffer(Math.min(MAX_PROCESS_OUTPUT_CHARS, 200_000), 0);
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let hasStdout = false;
     let done = false;
     const finish = (result) => {
       if (done) return;
@@ -405,12 +438,13 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
       });
     }, timeoutMs);
 
-    child.stdout.on("data", (d) => out.append(d));
-    child.stderr.on("data", (d) => err.append(d)); // both CLIs stream progress here
+    child.stdout.on("data", (d) => { hasStdout ||= d.length > 0; out.append(stdoutDecoder.write(d)); });
+    child.stderr.on("data", (d) => err.append(stderrDecoder.write(d)));
     child.on("error", (e) => finish({ ok: false, text: `(could not start ${bin}: ${e.message})`, raw: e.message }));
     child.on("close", (code, signal) => {
-      const stdout = out.text();
-      const parsed = codexJson ? parseCodexJsonLines(stdout) : { text: stdout.trim(), sessionId: null, failed: false, errors: "" };
+      out.append(stdoutDecoder.end());
+      err.append(stderrDecoder.end());
+      const parsed = codexJson ? out.result() : { text: out.text().trim(), sessionId: null, failed: false, errors: "" };
       const stderrTail = err.text().trim().split("\n").slice(-12).join("\n");
       const ok = code === 0 && !signal && !parsed.failed;
       if (ok && parsed.text) return finish({ ok: true, text: parsed.text, sessionId: parsed.sessionId });
@@ -422,6 +456,10 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
         text: `(${bin} ${reason})${details ? `\n${details}` : ""}`,
         raw: [parsed.errors, stderrTail].filter(Boolean).join("\n") || details,
         sessionId: parsed.sessionId,
+        exitCode: code,
+        signal,
+        hasStdout,
+        stderr: err.text(),
       });
     });
 
@@ -437,21 +475,24 @@ function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {})
  * face value. A model saying "I updated the repository layer" and Git status
  * showing three files changed are different claims, and only one is checkable.
  */
-function gitSnapshot(cwd) {
+function readGit(cwd, args) {
   return new Promise((resolve) => {
+    if (shuttingDown || requestCancelled()) return resolve(null);
     const base = cwd || DEFAULT_CWD || process.cwd();
     const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "git";
-    // -z is unambiguous for spaces, quotes and newlines in filenames. Porcelain
-    // v1 is stable across Git versions and reverses rename fields in -z mode.
-    const gitArgs = ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"];
+    const gitArgs = ["-c", "core.fsmonitor=false", ...args];
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", "git", ...gitArgs] : gitArgs;
-    const child = spawn(file, argv, { cwd: base, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(file, argv, { cwd: base, stdio: ["ignore", "pipe", "ignore"],
+      detached: !IS_WINDOWS, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+    trackChild(child);
+    child.stdout.setEncoding("utf8");
     let out = "";
     let done = false;
     const finish = (value) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      untrackChild(child);
       resolve(value);
     };
     child.stdout.on("data", (d) => {
@@ -459,17 +500,26 @@ function gitSnapshot(cwd) {
       // A repository with millions of unignored files should not take its MCP
       // host down. Reporting unavailable is safer than retaining unbounded data.
       if (out.length > 5_000_000) {
-        child.kill();
+        killTree(child);
         finish(null);
       }
     });
     child.on("error", () => finish(null)); // not a git repo, or no git: skip silently
-    child.on("close", (code) => finish(code === 0 ? snapshotEntries(base, out) : null));
+    child.on("close", (code) => finish(code === 0 ? out : null));
     const timer = setTimeout(() => {
-      child.kill();
+      killTree(child);
       finish(null);
     }, 10_000);
   });
+}
+
+async function gitSnapshot(cwd) {
+  const root = await readGit(cwd, ["rev-parse", "--show-toplevel"]);
+  if (!root) return null;
+  // Porcelain paths are relative to the repository root, NOT the caller's cwd.
+  const base = root.replace(/\r?\n$/, "");
+  const raw = await readGit(base, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+  return raw === null ? null : snapshotEntries(base, raw);
 }
 
 function gitPathDisplay(value) {
@@ -485,9 +535,9 @@ function fileFingerprint(base, relative) {
     // Hash ordinary source files so a second edit to an already-dirty path is
     // visible. Large generated files use metadata to keep snapshots bounded.
     if (stat.size <= 2_000_000) {
-      return `sha256:${crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
+      return `sha256:${stat.mode}:${crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
     }
-    return `large:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    return `large:${stat.mode}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
   } catch {
     return "missing";
   }
@@ -498,17 +548,22 @@ function snapshotEntries(base, raw) {
   const entries = new Map();
   for (let i = 0; i < records.length; ) {
     const record = records[i++];
-    if (!record || record.length < 4) continue;
-    const status = record.slice(0, 2);
-    const target = record.slice(3);
-    const renamed = /[RC]/.test(status);
-    const source = renamed ? records[i++] || "" : "";
+    if (!record || record[0] === "#" || record[0] === "!") continue;
+    // Porcelain v2 carries index object IDs and modes, so staging-only changes
+    // remain visible even when both XY and the on-disk content are unchanged.
+    const fields = { "1": 8, "2": 9, u: 10 }[record[0]];
+    const match = fields ? record.match(new RegExp(`^((?:[^ ]+ ){${fields}})([\\s\\S]*)$`)) : null;
+    if (!match && !record.startsWith("? ")) continue;
+    const metadata = match ? match[1] : "? ";
+    const status = match ? metadata.split(" ")[1].replace(/\./g, " ") : "??";
+    const target = match ? match[2] : record.slice(2);
+    const source = record[0] === "2" ? records[i++] || "" : "";
     const key = IS_WINDOWS ? target.toLowerCase() : target;
     entries.set(key, {
       status,
       target,
       source,
-      fingerprint: fileFingerprint(base, target),
+      fingerprint: `${metadata}\0${source}\0${fileFingerprint(base, target)}`,
       display: `${status} ${gitPathDisplay(target)}${source ? ` <- ${gitPathDisplay(source)}` : ""}`,
     });
   }
@@ -617,9 +672,8 @@ function codexArgs({ write, prompt, model, effort, resumeId }) {
     "--skip-git-repo-check",
     "--json",
     ...modelArgs("-m", model, chosen.model || CODEX_MODEL),
-    // A read-only sandbox prevents workspace edits. Ignoring user config and
-    // execpolicy rules also removes user-configured MCP servers and automation
-    // policy from a question/review run, closing side-effect paths outside Git.
+    // Read-only workspace sandbox plus user-config/execpolicy isolation. These
+    // flags do not promise to override managed policy or sandbox external tools.
     ...(!write ? ["--ephemeral", "--ignore-user-config", "--ignore-rules"] : []),
     // Exec options belong before its optional `resume` subcommand.
     ...(resumeId ? ["resume", resumeId] : []),
@@ -654,13 +708,17 @@ async function delegateToCodexUnlocked({ task, files, constraints, acceptance, v
   if (lane && RESUME_ENABLED && !resumeId && r.sessionId) saveLane(lane, r.sessionId, cwd);
   // Ask git what changed even when the run failed: a delegation that died partway
   // through still leaves edits behind, and that is exactly when you want to know.
-  const after = await gitSnapshot(cwd);
-  const diff = formatGitSummary(before, after);
   const verify = verifyCommand
-    ? REMOTE_MODE && !REMOTE_WRITES
+    ? REMOTE_MODE && (!REMOTE_WRITES || allow_writes === false)
       ? { ran: false, text: "verify skipped: remote writes are disabled, so host commands are not allowed" }
+      : !r.ok
+      ? { ran: false, text: "verify skipped: Codex did not complete successfully" }
       : await runVerify(verifyCommand, cwd)
     : null;
+  // Verification can generate files too. Report the tree actually returned to
+  // the caller, not a snapshot from before its check command ran.
+  const after = await gitSnapshot(cwd);
+  const diff = formatGitSummary(before, after);
 
   // Verdict first, then what changed, then the builder's own words last. The
   // caller should be able to stop reading after two lines when it passed.
@@ -669,7 +727,7 @@ async function delegateToCodexUnlocked({ task, files, constraints, acceptance, v
   parts.push(diff);
   if (!verify) parts.push("No verify command was given, so nothing here confirms the change works. Inspect the working tree.");
   parts.push(`codex said:\n${r.text}`);
-  return { ...r, ok: r.ok && (!verify || !verify.ran || verify.ok), text: parts.join("\n\n") };
+  return { ...r, peerOk: r.ok, ok: r.ok && (!verify || (verify.ran && verify.ok)), text: parts.join("\n\n") };
 }
 
 async function delegateToCodex(spec) {
@@ -694,9 +752,9 @@ async function delegateToCodex(spec) {
 // rejection of one of these is retried without it and reported.
 const CLAUDE_OPTIONAL_FLAGS = new Set(["--no-session-persistence"]);
 
-/** Pull the flag name out of a CLI's complaint, whatever wording it used. */
+/** Recognize an anchored parser diagnostic, not a quotation in an answer. */
 function rejectedFlag(text = "") {
-  const m = text.match(/(?:unknown|unrecognized|unexpected)\s+(?:option|flag|argument)[:\s]+'?(--?[A-Za-z0-9][-A-Za-z0-9]*)'?/i);
+  const m = text.match(/^\s*(?:error:\s*)?(?:unknown|unrecognized|unexpected)\s+(?:option|flag|argument)[:\s]+['"`“‘]?(--?[A-Za-z0-9][-A-Za-z0-9]*)(?=['"`”’\s]|$)/i);
   return m ? m[1] : null;
 }
 
@@ -726,10 +784,14 @@ async function askClaude({ question, cwd, model, effort }) {
   ];
 
   const prompt = askFrame(question);
+  const deadline = Date.now() + ASK_TIMEOUT_MS;
   const first = await runAgent(CLAUDE_BIN, args, prompt, cwd, ASK_TIMEOUT_MS);
   if (first.ok) return first;
 
-  const flag = rejectedFlag(first.raw || first.text);
+  // Only a pre-execution parser failure may retry. Partial answers, signals,
+  // timeouts and runtime failures must never replay a potentially costly task.
+  const flag = [1, 2].includes(first.exitCode) && !first.signal && !first.hasStdout
+    ? rejectedFlag(first.stderr) : null;
   if (!flag) return first;
 
   if (!CLAUDE_OPTIONAL_FLAGS.has(flag)) {
@@ -737,14 +799,16 @@ async function askClaude({ question, cwd, model, effort }) {
       ...first,
       ok: false,
       text:
-        `Claude Code rejected ${flag}, which is part of ask_claude's read-only guarantee, so the call was not retried. ` +
+        `Claude Code rejected ${flag}, which is ${["--restricted", "--bare", "--tools", "--disallowedTools"].includes(flag) ? "part of ask_claude's read-only guarantee" : "a required CLI argument"}, so the call was not retried. ` +
         `--restricted requires Claude Code 2.1.248 or newer; check \`claude --version\` and upgrade. ` +
         `Answer from your own knowledge and tell the user ask_claude is unavailable on this machine.\n\n${first.text}`,
     };
   }
 
   const retryArgs = args.filter((a) => a !== flag);
-  const second = await runAgent(CLAUDE_BIN, retryArgs, prompt, cwd, ASK_TIMEOUT_MS);
+  const remaining = deadline - Date.now();
+  if (remaining <= 0 || requestCancelled()) return first;
+  const second = await runAgent(CLAUDE_BIN, retryArgs, prompt, cwd, remaining);
   const note = `(agent-bridge: this Claude Code does not accept ${flag}; retried without it. The read-only flags were unaffected.)`;
   return { ...second, text: `${note}\n\n${second.text}` };
 }
@@ -1157,6 +1221,7 @@ function usageFromAppServer() {
     const timer = setTimeout(() => finish(null), 8000);
     child.on("error", () => finish(null));
     child.on("close", () => finish(null));
+    child.stdin.on("error", () => finish(null));
     child.stdout.on("data", (d) => {
       out += d;
       if (out.length > 200_000) return finish(null);
@@ -1441,6 +1506,7 @@ const TOOLS = [
               cwd: CWD_PROP,
               lane: { type: "string", description: "Thread of related builds, as in delegate_to_codex." },
               effort: EFFORT_PROP,
+              model: MODEL_PROP,
             },
             required: ["task"],
           },
@@ -1495,6 +1561,7 @@ const TOOLS = [
       const wanted = ids?.length ? ids.map((id) => jobs.get(id)) : [...jobs.values()];
       if (!wanted.length) return { ok: true, text: "No outstanding Codex jobs." };
       const settled = await Promise.all(wanted.map((j) => j.promise));
+      if (requestCancelled()) return { ok: false, text: "Collection cancelled; job results remain available for a later collect." };
       settled.forEach((j) => jobs.delete(j.id));
       return {
         ok: settled.every((j) => j.status === "done"),
@@ -1595,10 +1662,48 @@ function modernizeResult(msg, result) {
   return modern;
 }
 
-async function handle(msg) {
-  if (!msg || Array.isArray(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
-    return { __error: { code: -32600, message: "invalid JSON-RPC request" } };
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const validId = (id) => typeof id === "string" || (typeof id === "number" && Number.isFinite(id));
+const rpcError = (code, message) => ({ __error: { code, message } });
+
+function validateRequest(msg) {
+  if (!isObject(msg) || msg.jsonrpc !== "2.0" || typeof msg.method !== "string" ||
+      (msg.id !== undefined && !validId(msg.id))) {
+    return rpcError(-32600, "invalid JSON-RPC request");
   }
+  if (msg.params !== undefined && !isObject(msg.params)) return rpcError(-32602, "params must be an object");
+  return null;
+}
+
+// Validate every declared field before tools run. In particular, a bad second
+// job must not throw after the first one has already been accepted and launched.
+function validateArguments(value, schema, label = "arguments") {
+  if (schema.type === "object") {
+    if (!isObject(value)) return `${label} must be an object`;
+    for (const key of schema.required || []) {
+      if (value[key] === undefined || (typeof value[key] === "string" && !value[key].trim())) return `${label}.${key} is required`;
+    }
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      if (value[key] === undefined) continue;
+      const error = validateArguments(value[key], child, `${label}.${key}`);
+      if (error) return error;
+    }
+  } else if (schema.type === "array") {
+    if (!Array.isArray(value)) return `${label} must be an array`;
+    if (schema.minItems && value.length < schema.minItems) return `${label} must be a non-empty array`;
+    if (schema.maxItems && value.length > schema.maxItems) return `${label} accepts at most ${schema.maxItems} jobs`;
+    for (const [index, item] of value.entries()) {
+      const error = validateArguments(item, schema.items, `${label}[${index}]`);
+      if (error) return error;
+    }
+  } else if (typeof value !== schema.type) return `${label} must be a ${schema.type}`;
+  if (schema.enum && !schema.enum.includes(value)) return `${label} must be one of ${schema.enum.join(", ")}`;
+  return null;
+}
+
+async function handle(msg) {
+  const invalid = validateRequest(msg);
+  if (invalid) return invalid;
   const protocol = requestProtocol(msg);
   if (protocol && protocol !== MODERN_PROTOCOL_VERSION && !LEGACY_PROTOCOL_VERSIONS.includes(protocol)) {
     return {
@@ -1685,9 +1790,9 @@ async function handle(msg) {
         };
       }
 
-      const args = msg.params?.arguments || {};
-      const required = tool.inputSchema.required?.[0];
-      if (required && !args[required]) throw new Error(`${required} is required`);
+      const args = msg.params?.arguments ?? {};
+      const argumentError = validateArguments(args, tool.inputSchema);
+      if (argumentError) return rpcError(-32602, argumentError);
 
       // If this peer has already failed twice, stop trying. Whatever the cause,
       // it is not going to fix itself mid-session, and each attempt costs the
@@ -1714,7 +1819,8 @@ async function handle(msg) {
       const seconds = Math.round((Date.now() - startedAt) / 1000);
 
       if (!tool.local) {
-        if (r.ok) failures[tool.peer] = 0;
+        // A bad repository check is not evidence that the peer CLI is broken.
+        if (r.peerOk ?? r.ok) failures[tool.peer] = 0;
         else failures[tool.peer] += 1;
       }
       log(`${tool.name} ${r.ok ? "ok" : "FAILED"} in ${seconds}s, ${r.text.length} chars`);
@@ -1730,7 +1836,7 @@ async function handle(msg) {
       // The Claude desktop app gives an extension no way to draw UI, so the tool
       // result is the only surface there. One compact line, not a dashboard.
       const usage = tool.peer === "Codex" && !tool.local ? codexUsageCached() : null;
-      const modelShown = args.model || chosen.model || "CLI default";
+      const modelShown = args.model || chosen.model || (tool.peer === "Codex" ? CODEX_MODEL : CLAUDE_MODEL) || "CLI default";
       const footer = [
         tool.name,
         chosen.tier,
@@ -1787,6 +1893,12 @@ function startStdio() {
       log("rejected unparseable JSON-RPC line");
       return send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
     }
+    const invalid = validateRequest(msg);
+    if (invalid) return send({ jsonrpc: "2.0", id: validId(msg?.id) ? msg.id : null, error: invalid.__error });
+    if (msg.id !== undefined) {
+      if (activeRequests.has(msg.id)) return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: "duplicate active request id" } });
+      activeRequests.add(msg.id);
+    }
     try {
       if (isModernRequest(msg)) modernClient = true;
       const result = modernizeResult(msg, await requestScope.run(msg.id, () => handle(msg)));
@@ -1819,10 +1931,23 @@ function startHttp() {
 
   const server = http.createServer(async (req, res) => {
     let completed = false;
+    let disconnected = false;
     const requestToken = Symbol("http-request");
+    const cleanupListeners = () => {
+      req.socket.removeListener("close", onDisconnect);
+      res.removeListener("close", onDisconnect);
+    };
+    const onDisconnect = () => {
+      if (!completed) {
+        disconnected = true;
+        cancelRequest(requestToken);
+      }
+      cleanupListeners();
+    };
     const reply = (code, body) => {
-      if (completed || res.writableEnded) return;
+      if (completed || disconnected || res.writableEnded) return;
       completed = true;
+      cleanupListeners();
       if (body === undefined) {
         res.writeHead(code);
         res.end();
@@ -1831,14 +1956,11 @@ function startHttp() {
         res.end(JSON.stringify(body));
       }
     };
-    res.on("close", () => {
-      // Modern Streamable HTTP defines a closed response stream as cancellation.
-      // A unique token avoids collisions when two clients reuse JSON-RPC id 1.
-      if (!completed) cancelRequest(requestToken);
-    });
-    req.socket.on("close", () => {
-      if (!completed) cancelRequest(requestToken);
-    });
+    // Remove both listeners on completion; keep-alive sockets serve many calls.
+    // A unique token prevents cross-client collisions of JSON-RPC IDs.
+    res.once("close", onDisconnect);
+    req.socket.once("close", onDisconnect);
+    req.on("error", onDisconnect);
 
     const origin = req.headers.origin;
     if (origin && !HTTP_ALLOWED_ORIGINS.has(origin)) {
@@ -1866,6 +1988,7 @@ function startHttp() {
       else chunks.push(d);
     });
     req.on("end", async () => {
+      if (disconnected) return;
       if (tooLarge) {
         return reply(413, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "request body too large" } });
       }
@@ -1876,8 +1999,14 @@ function startHttp() {
         return reply(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
       }
 
+      const invalid = validateRequest(msg);
+      if (invalid) return reply(400, { jsonrpc: "2.0", id: validId(msg?.id) ? msg.id : null, error: invalid.__error });
+
       const protocol = requestProtocol(msg);
       const protocolHeader = req.headers["mcp-protocol-version"];
+      if (protocolHeader && ![MODERN_PROTOCOL_VERSION, ...LEGACY_PROTOCOL_VERSIONS].includes(protocolHeader)) {
+        return reply(400, { jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32022, message: "Unsupported protocol version" } });
+      }
       const methodHeader = req.headers["mcp-method"];
       const nameHeader = req.headers["mcp-name"];
       if (protocol === MODERN_PROTOCOL_VERSION || protocolHeader === MODERN_PROTOCOL_VERSION) {
@@ -1906,10 +2035,11 @@ function startHttp() {
       }
 
       try {
+        activeRequests.add(requestToken);
         const result = modernizeResult(msg, await requestScope.run(requestToken, () => handle(msg)));
         if (result === null) return reply(202);
         if (result.__error) {
-          const status = result.__error.code === -32022 ? 400 : isModernRequest(msg) && result.__error.code === -32601 ? 404 : 200;
+          const status = [-32022, -32600, -32602].includes(result.__error.code) ? 400 : isModernRequest(msg) && result.__error.code === -32601 ? 404 : 200;
           return reply(status, { jsonrpc: "2.0", id: msg.id, error: result.__error });
         }
         reply(200, { jsonrpc: "2.0", id: msg.id, result });
@@ -1925,7 +2055,7 @@ function startHttp() {
   // tunnel you set up on purpose is a much smaller mistake than a port you left
   // open on a hotel wifi without noticing.
   server.listen(REMOTE_PORT, REMOTE_HOST, () => {
-    log(`http listening on ${REMOTE_HOST}:${REMOTE_PORT}/mcp/[redacted]`);
+    log(`http listening on ${REMOTE_HOST}:${server.address().port}/mcp/[redacted]`);
     log(`remote writes: ${REMOTE_WRITES ? "ENABLED" : "disabled (delegations run read-only)"}`);
     log(`browser origins: ${HTTP_ALLOWED_ORIGINS.size ? [...HTTP_ALLOWED_ORIGINS].join(", ") : "none allowed"}`);
   });

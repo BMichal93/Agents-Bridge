@@ -24,9 +24,12 @@ const fail = (name, detail = "") => results.push({ state: "FAIL", name, detail }
 const skip = (name, detail = "") => results.push({ state: "skip", name, detail });
 
 function run(bin, args, { input, timeout = 60_000, cwd } = {}) {
+  if (IS_WINDOWS && [bin, ...args].some((value) => /[&|<>^%!()"\r\n]/.test(value))) {
+    return { status: 1, stdout: "", stderr: "unsafe Windows command argument", out: "unsafe Windows command argument" };
+  }
   const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : bin;
   const argv = IS_WINDOWS ? ["/d", "/s", "/c", bin, ...args] : args;
-  const result = spawnSync(file, argv, { encoding: "utf8", input, timeout, cwd });
+  const result = spawnSync(file, argv, { encoding: "utf8", input, timeout, cwd, maxBuffer: 1_000_000 });
   const stdout = result.stdout || "";
   const stderr = result.stderr || "";
   return { status: result.status, stdout, stderr, out: `${stdout}${stderr}` };
@@ -69,7 +72,8 @@ function probeAppServer() {
     const argv = IS_WINDOWS ? ["/d", "/s", "/c", CODEX, "app-server"] : ["app-server"];
     let child;
     try {
-      child = spawn(file, argv, { stdio: ["pipe", "pipe", "ignore"] });
+      if (IS_WINDOWS && /[&|<>^%!()"\r\n]/.test(CODEX)) return resolve({ ok: false, detail: "unsafe Windows command argument" });
+      child = spawn(file, argv, { stdio: ["pipe", "pipe", "ignore"], detached: !IS_WINDOWS });
     } catch (error) {
       return resolve({ ok: false, detail: error.message });
     }
@@ -80,14 +84,18 @@ function probeAppServer() {
       done = true;
       clearTimeout(timer);
       try {
-        child.kill();
+        if (IS_WINDOWS) spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+        else process.kill(-child.pid, "SIGKILL");
       } catch {}
       resolve(value);
     };
     const timer = setTimeout(() => finish({ ok: false, detail: "timed out" }), 12_000);
     child.on("error", (error) => finish({ ok: false, detail: error.message }));
+    child.on("close", () => finish({ ok: false, detail: "app-server closed before replying" }));
+    child.stdin.on("error", () => finish({ ok: false, detail: "app-server closed its input" }));
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
+      if (buffer.length > 200_000) return finish({ ok: false, detail: "app-server output limit exceeded" });
       let newline;
       while ((newline = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, newline);
@@ -111,6 +119,53 @@ function probeAppServer() {
     child.stdin.write(
       JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-bridge-doctor", version: "1" } } }) + "\n"
     );
+  });
+}
+
+// Exercise ask_claude THROUGH the shipped MCP server. Duplicating its argv here
+// missed 0.9.8's optional-flag fallback and produced a false-negative doctor.
+function probeClaudeBridge(cwd) {
+  return new Promise((resolve) => {
+    const server = fileURLToPath(new URL("../src/agent-bridge.mjs", import.meta.url));
+    const child = spawn(process.execPath, [server], {
+      env: { ...process.env, AGENT_BRIDGE_HTTP: "0", AGENT_BRIDGE_DEPTH: "0",
+        AGENT_BRIDGE_CODEX_BIN: CODEX, AGENT_BRIDGE_CLAUDE_BIN: CLAUDE },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let output = "";
+    let outcome = null;
+    const finish = (value) => {
+      if (outcome) return;
+      outcome = value;
+      clearTimeout(timer);
+      // Let bridge shutdown kill its own process groups before doctor returns.
+      child.kill();
+    };
+    const timer = setTimeout(() => finish({ ok: false, detail: "bridge probe timed out" }), 250_000);
+    child.on("error", (error) => { clearTimeout(timer); resolve({ ok: false, detail: error.message }); });
+    child.on("close", () => { clearTimeout(timer); resolve(outcome || { ok: false, detail: "bridge closed before replying" }); });
+    child.stdin.on("error", () => finish({ ok: false, detail: "bridge input closed" }));
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (output.length > 100_000) return finish({ ok: false, detail: "bridge output limit exceeded" });
+      let nl;
+      while ((nl = output.indexOf("\n")) >= 0) {
+        const line = output.slice(0, nl);
+        output = output.slice(nl + 1);
+        try {
+          const response = JSON.parse(line);
+          if (response.id !== 1) continue;
+          const text = response.result?.content?.[0]?.text || response.error?.message || "no answer";
+          const answer = text.replace(/^\(agent-bridge:[^\n]*\)\n\n/, "").replace(/\n\n\(ask_claude[^\n]*\)$/, "").trim();
+          const ok = !response.error && !response.result?.isError && /^PONG[.!]?$/i.test(answer);
+          finish({ ok, detail: ok ? "restricted bridge call answered" + (text.includes("retried without") ? "; optional flag fallback exercised" : "") : text.slice(0, 500) });
+        } catch {}
+      }
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "ask_claude", arguments: { question: "Reply with exactly the word PONG and nothing else.", cwd, effort: "fast" },
+    } }) + "\n");
   });
 }
 
@@ -181,13 +236,9 @@ async function main() {
       skip("claude exact read-only run", "--no-live was passed");
     } else {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bridge-doctor-claude-"));
-      const live = run(
-        CLAUDE,
-        ["--restricted", "--bare", "--no-session-persistence", "-p", "--tools", "Read,Grep,Glob", "--disallowedTools", "mcp__*"],
-        { input: "Reply with exactly the word PONG and nothing else.", timeout: 240_000, cwd: tmp }
-      );
-      if (live.status === 0 && /^PONG[.!]?$/i.test(live.stdout.trim())) pass("claude exact read-only run", "restricted bare call answered");
-      else fail("claude exact read-only run", live.out.trim().split("\n").slice(-4).join(" | ") || "no exact answer");
+      const live = await probeClaudeBridge(tmp);
+      if (live.ok) pass("claude exact read-only run", live.detail);
+      else fail("claude exact read-only run", live.detail);
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   }

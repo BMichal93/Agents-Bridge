@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.9
+
+- Retain Claude's optional-versus-required flag split. Recognize quoted parser
+  diagnostics on stderr, avoid replaying partial answers, share one timeout.
+- Make the Claude doctor probe call the actual MCP tool (including fallback).
+- Reject malformed JSON-RPC and invalid batches before execution; prevent null
+  HTTP body crashes and clean up keep-alive cancellation listeners.
+- Track active cancellation IDs only and retain results of cancelled collections.
+- Parse Codex JSONL incrementally so trimming cannot hide failure events.
+  Preserve split UTF-8; fail on oversized events or missing final answers.
+- Resolve Git porcelain v2 paths from the repository root; include index hashes,
+  modes, and verification side effects in the final observations.
+- Requested verification must run and pass; do not execute it after failed peers.
+- Correct the budget demo to actually verify and resume its stub lane, and fail
+  the demo when a scenario fails instead of silently measuring error responses.
+- Add 20 regression tests and a target-machine release gate. See
+  CODEX_REVIEW_0.9.9.md and LIVE_SMOKE_TESTS.md.
+
 ## 0.9.8
 
 - Response pack for the Codex 0.9.7 review: START_HERE_CODEX.md and

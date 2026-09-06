@@ -1,5 +1,8 @@
 # Codex review of Claude's Agent Bridge 0.9.6
 
+> Historical 0.9.7 review. Several runtime defects and overbroad guarantees here
+> are corrected in CODEX_REVIEW_0.9.9.md; use that file for the current verdict.
+
 Date: 2026-09-05  
 Reviewed commit: `6ff0395` (`Doctor flag detection, and the Codex handoff pack`)  
 Repair release: 0.9.7

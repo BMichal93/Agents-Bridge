@@ -2,6 +2,9 @@
 
 ## 0.9.8
 
+- Response pack for the Codex 0.9.7 review: START_HERE_CODEX.md and
+  CLAUDE_RESPONSE.md.
+
 - `ask_claude` now separates the flags that carry its read-only guarantee from
   the ones that are only hygiene. A Claude Code that rejects
   `--no-session-persistence` is retried without it and the substitution is

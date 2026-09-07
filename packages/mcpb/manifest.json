@@ -1,0 +1,74 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "agent-bridge",
+  "display_name": "Agent Bridge (Codex)",
+  "version": "0.9.10",
+  "description": "Ask OpenAI Codex questions and delegate coding work to it from Claude.",
+  "long_description": "Adds tools for asking Codex for a second opinion, delegating implementation, running bounded independent Codex jobs, retaining project context and consulting Claude Code in the reverse direction. Questions isolate user configuration; Claude reviews use restricted and bare modes. Local delegations use Codex's workspace-write sandbox. Remote HTTP delegations stay read-only unless remote writes are explicitly enabled. Results include fingerprinted working-tree observations, including changes to already-dirty files. Requires the Codex CLI installed and signed in; ask_claude also requires Claude Code 2.1.248 or newer.",
+  "author": {
+    "name": "Michal Budziszewski"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "delegation",
+    "multi-agent"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "server/agent-bridge.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/agent-bridge.mjs"
+      ],
+      "env": {
+        "AGENT_BRIDGE_DEFAULT_CWD": "${user_config.default_project}",
+        "AGENT_BRIDGE_CONSERVE": "${user_config.conserve_mode}",
+        "AGENT_BRIDGE_CODEX_BIN": "${user_config.codex_path}",
+        "AGENT_BRIDGE_CLAUDE_BIN": "${user_config.claude_path}"
+      }
+    }
+  },
+  "user_config": {
+    "default_project": {
+      "type": "directory",
+      "title": "Default project folder",
+      "description": "Where Codex runs when you do not name a folder. The desktop app has no project context, so without this every question has to carry a full path.",
+      "required": false
+    },
+    "conserve_mode": {
+      "type": "string",
+      "title": "Conserve mode",
+      "description": "Set to 1 to make delegating to Codex the default rather than the exception. Use it when you are short on Claude usage.",
+      "default": "0",
+      "required": false
+    },
+    "codex_path": {
+      "type": "string",
+      "title": "Codex command",
+      "description": "Leave as codex unless it is not on your PATH, in which case give the full path.",
+      "default": "codex",
+      "required": false
+    },
+    "claude_path": {
+      "type": "string",
+      "title": "Claude Code command",
+      "description": "Leave as claude unless it is not on your PATH.",
+      "default": "claude",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}

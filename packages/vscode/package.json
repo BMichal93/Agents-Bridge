@@ -1,0 +1,83 @@
+{
+  "name": "agent-bridge",
+  "displayName": "Agent Bridge: delegate to Codex",
+  "description": "Let Claude and Copilot hand coding work to OpenAI Codex, and ask it for second opinions. Install and it works until you disable it.",
+  "version": "0.9.10",
+  "publisher": "mbudziszewski",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "mcp",
+    "codex",
+    "claude",
+    "agent",
+    "delegation"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "files": [
+    "extension.js",
+    "README.md",
+    "server/agent-bridge.mjs"
+  ],
+  "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "agent-bridge.servers",
+        "label": "Agent Bridge"
+      }
+    ],
+    "commands": [
+      {
+        "command": "agentBridge.showStatus",
+        "title": "Agent Bridge: Status and options"
+      },
+      {
+        "command": "agentBridge.enableForClis",
+        "title": "Agent Bridge: Enable for Codex and Claude Code"
+      },
+      {
+        "command": "agentBridge.disableForClis",
+        "title": "Agent Bridge: Remove from Codex and Claude Code"
+      },
+      {
+        "command": "agentBridge.toggleConserve",
+        "title": "Agent Bridge: Toggle conserve mode (push more work to Codex)"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Bridge",
+      "properties": {
+        "agentBridge.defaultProject": {
+          "type": "string",
+          "default": "",
+          "description": "Folder Codex runs in when a request does not name one. Leave blank to use the open workspace."
+        },
+        "agentBridge.conserveMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Treat delegating to Codex as the default rather than the exception. Turn this on when you are short on Claude usage."
+        },
+        "agentBridge.codexPath": {
+          "type": "string",
+          "default": "codex",
+          "description": "Full path to the codex command, if it is not on your PATH."
+        },
+        "agentBridge.claudePath": {
+          "type": "string",
+          "default": "claude",
+          "description": "Full path to the claude command, if it is not on your PATH."
+        }
+      }
+    }
+  }
+}

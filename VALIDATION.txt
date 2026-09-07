@@ -1,0 +1,73 @@
+Agent Bridge 0.9.10 - Claude validation record
+================================================
+
+Review completed: 2026-09-07
+Codex baseline:   0712478 (0.9.9 review candidate)
+Claude response:  49af3ec3cd20cc11b740e8f1041d8150b2cf38bb
+Environment: Linux, Node v22.22.2. No CLI installed. No live model call made.
+
+REPRODUCTION OF THE CODEX 0.9.9 GATE
+
+PASS  Pack integrity
+      All eight SHA-256 hashes verified. Source ZIP unpacked with the complete
+      inherited history; HEAD matched SOURCE_COMMIT.txt; working tree clean.
+
+PASS  npm run check                 (on 0.9.9, before any change)
+PASS  npm test                      69 passed, 0 failed. Matches the record.
+PASS  npm run doctor -- --no-live   1 passed, 0 failed, 2 skipped. Matches.
+PASS  npm run budget                2.9x; still reports a loss on small tasks.
+
+REVIEW OF THE 0.9.9 REPAIRS TO CLAUDE'S 0.9.8 WORK
+
+ACCEPTED  rejectedFlag() replay defect. The repair is correct and stronger than
+          the original: an anchored parser diagnostic, exit code 1 or 2, no
+          signal, no stdout, a shared deadline and a cancellation check. The
+          replay path Claude shipped was real.
+ACCEPTED  Doctor issued its own Claude invocation without the 0.9.8 fallback.
+          Calling the actual MCP tool is the right integration.
+
+DEFECT FOUND IN 0.9.9
+
+      The persistence fallback disclosed its consequence only in the README.
+      START_HERE_CLAUDE.md line 42 asks for the fallback to be disclosed, and
+      the README was corrected, but the runtime note still said only that the
+      read-only flags were unaffected. The person whose question is about to be
+      written to disk sees the tool result, not the README, and a calling model
+      relaying the answer cannot pass on a caveat it never received.
+
+      Fixed in 0.9.10: the note states that the question and answer may be
+      written to Claude Code's local session history. The existing regression
+      test now asserts it.
+
+VALIDATION OF 0.9.10
+
+PASS  npm run check
+PASS  npm test                      69 passed, 0 failed, 0 skipped.
+PASS  npm run budget                2.9x on defaults.
+PASS  npm run doctor -- --no-live   1 passed, 0 failed, 2 skipped.
+PASS  npm run build                 both bundles; manifests report 0.9.10.
+PASS  installer integrity           Both archives open cleanly, report 0.9.10,
+                                    and their embedded agent-bridge.mjs is
+                                    byte-identical to src/agent-bridge.mjs.
+PASS  source integrity              Clean tree at packaging; ZIP includes .git.
+
+Reviewed server SHA-256:
+  5fcbb2dff507c2cdf00428cfff6e1747dbd3a4bf7ead6f328bda335d65836254
+
+LIVE_SMOKE_TESTS.md - BLOCKED, NOT RUN
+
+Section 1 Basic compatibility        BLOCKED  no codex or claude binary present
+Section 2 Read-only review           BLOCKED  requires an authenticated CLI and
+                                              a real MCP host tool trace
+Section 3 Verified write, lane resume BLOCKED  requires authenticated codex exec
+                                              and codex exec resume
+Windows coverage                     BLOCKED  Linux container only
+
+Reason: this environment has no Codex or Claude Code installation, no provider
+credentials and no Windows host. Nothing here was run against a model. No stub
+result in this record is presented as a live pass.
+
+Three review passes have now ended at the same boundary. The remaining risk is
+not in the code that either reviewer can read; it is in whether the installed
+CLIs accept these exact invocations. That evidence can only come from the target
+machine.

@@ -1,0 +1,28 @@
+name: Release
+
+# Tag a version and the installable bundles show up on the release page, which is
+# the closest thing to a download link until the extension is published.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: npm test
+      - run: npm run build
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.mcpb
+            dist/*.vsix
+          generate_release_notes: true

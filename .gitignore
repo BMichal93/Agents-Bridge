@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vsix
+*.mcpb
+# Build output only. The server lives in src/ and is copied in at build time,
+# so a copy sitting in a package folder is stale by definition.
+packages/mcpb/server/
+packages/vscode/server/

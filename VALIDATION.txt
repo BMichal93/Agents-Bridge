@@ -1,54 +1,73 @@
-Agent Bridge 0.9.9 — Codex validation record
-Review dates: 2026-09-06–07
-Input: agent-bridge-0.9.8-codex-review-pack.zip
-Input source head: 6f373b0 (behavioral change 50403aa)
-Environment: Linux, Node v24.19.0, npm 11.9.0
+Agent Bridge 0.9.10 - Claude validation record
+================================================
 
-BASELINE
-PASS: all six incoming pack SHA-256 checksums.
-PASS: clean inherited Git repository with history.
-PASS: npm test on unchanged 0.9.8 — 49 passed, 0 failed.
+Review completed: 2026-09-07
+Codex baseline:   0712478 (0.9.9 review candidate)
+Claude response:  49af3ec3cd20cc11b740e8f1041d8150b2cf38bb
+Environment: Linux, Node v22.22.2. No CLI installed. No live model call made.
 
-FINAL GATES
-PASS: npm run check — server, extension and doctor syntax.
-PASS: npm test — 69 passed, 0 failed, 0 skipped; about 23.4 seconds.
-      Includes 20 new regression tests in test/review-099.test.mjs.
-PASS: npm run budget — every scenario must now succeed, including real
-      node --version verification and stub JSONL lane resume.
-      Tool definitions: 9,793 characters; returned results: 2,248 characters.
-      Combined: 12,041 characters (~3,010 tokens by the script's estimate).
-      Default five-task estimate: ~40,940 caller-context tokens saved, 2.9x.
-      These are synthetic scenario estimates, NOT total billing or live usage.
-PASS: small-task budget scenario reports a loss; covered by the test suite.
-PASS: npm run doctor -- --no-live — 1 passed, 0 failed, 2 skipped.
-      Node passed. Codex and Claude were absent and explicitly skipped.
-PASS: npm run build — both 0.9.9 installers rebuilt successfully.
-PASS: unzip -t on MCPB and VSIX.
-PASS: both embedded server files are byte-identical to src/agent-bridge.mjs.
-PASS: the VSIX extension is byte-identical to packages/vscode/extension.js.
-PASS: MCPB and VSIX package manifests both report 0.9.9.
-PASS: git diff --check.
-PASS: generated Claude delegation skill frontmatter/naming validation.
-PASS: legacy initialize and modern discovery return identical delegation guidance;
-      all five named review/build/collection tools remain discoverable.
-PASS: independent ChatGPT subagent reviewed delegation/handoff instructions;
-      corrected verification/Git overclaims and scoped optional Claude live gates.
-      This reviewer ran through this session's tools, not an authenticated bridge CLI.
+REPRODUCTION OF THE CODEX 0.9.9 GATE
 
-SERVER / INSTALLER SHA-256
-e12577f8a4dec637cfdda5e3a83abba26c358b35f760d89a49479ffa5cc15e5b  src/agent-bridge.mjs
-607ef3bd90b2ff30d2d7e9ad3a61fe317580f40324499846cda38b1d61af7a33  agent-bridge-0.9.9.mcpb
-aee3b262c7f4e4f38d19c0ceeb0a9758713dabfe6e0e6a328d33cb94b480c188  agent-bridge-0.9.9.vsix
+PASS  Pack integrity
+      All eight SHA-256 hashes verified. Source ZIP unpacked with the complete
+      inherited history; HEAD matched SOURCE_COMMIT.txt; working tree clean.
 
-EVIDENCE BOUNDARIES
-- No authenticated Codex or Claude model call was executed.
-- The doctor fallback test uses a stub CLI; it is NOT a live compatibility pass.
-- No Windows execution or interactive Claude Desktop / VS Code install was done.
-- No repository was pushed and no release was published.
-- Claims are process-local and verification is trusted host execution.
-- Read-only workspace behavior is not a guarantee of no local metadata writes
-  or of overriding every managed/project configuration layer.
+PASS  npm run check                 (on 0.9.9, before any change)
+PASS  npm test                      69 passed, 0 failed. Matches the record.
+PASS  npm run doctor -- --no-live   1 passed, 0 failed, 2 skipped. Matches.
+PASS  npm run budget                2.9x; still reports a loss on small tasks.
 
-Read CODEX_REVIEW_0.9.9.md for feedback and LIVE_SMOKE_TESTS.md for the exact
-next-machine gate. The release candidate must not be described as live-certified.
-The outer pack SHA256SUMS additionally covers source, docs, and this record.
+REVIEW OF THE 0.9.9 REPAIRS TO CLAUDE'S 0.9.8 WORK
+
+ACCEPTED  rejectedFlag() replay defect. The repair is correct and stronger than
+          the original: an anchored parser diagnostic, exit code 1 or 2, no
+          signal, no stdout, a shared deadline and a cancellation check. The
+          replay path Claude shipped was real.
+ACCEPTED  Doctor issued its own Claude invocation without the 0.9.8 fallback.
+          Calling the actual MCP tool is the right integration.
+
+DEFECT FOUND IN 0.9.9
+
+      The persistence fallback disclosed its consequence only in the README.
+      START_HERE_CLAUDE.md line 42 asks for the fallback to be disclosed, and
+      the README was corrected, but the runtime note still said only that the
+      read-only flags were unaffected. The person whose question is about to be
+      written to disk sees the tool result, not the README, and a calling model
+      relaying the answer cannot pass on a caveat it never received.
+
+      Fixed in 0.9.10: the note states that the question and answer may be
+      written to Claude Code's local session history. The existing regression
+      test now asserts it.
+
+VALIDATION OF 0.9.10
+
+PASS  npm run check
+PASS  npm test                      69 passed, 0 failed, 0 skipped.
+PASS  npm run budget                2.9x on defaults.
+PASS  npm run doctor -- --no-live   1 passed, 0 failed, 2 skipped.
+PASS  npm run build                 both bundles; manifests report 0.9.10.
+PASS  installer integrity           Both archives open cleanly, report 0.9.10,
+                                    and their embedded agent-bridge.mjs is
+                                    byte-identical to src/agent-bridge.mjs.
+PASS  source integrity              Clean tree at packaging; ZIP includes .git.
+
+Reviewed server SHA-256:
+  5fcbb2dff507c2cdf00428cfff6e1747dbd3a4bf7ead6f328bda335d65836254
+
+LIVE_SMOKE_TESTS.md - BLOCKED, NOT RUN
+
+Section 1 Basic compatibility        BLOCKED  no codex or claude binary present
+Section 2 Read-only review           BLOCKED  requires an authenticated CLI and
+                                              a real MCP host tool trace
+Section 3 Verified write, lane resume BLOCKED  requires authenticated codex exec
+                                              and codex exec resume
+Windows coverage                     BLOCKED  Linux container only
+
+Reason: this environment has no Codex or Claude Code installation, no provider
+credentials and no Windows host. Nothing here was run against a model. No stub
+result in this record is presented as a live pass.
+
+Three review passes have now ended at the same boundary. The remaining risk is
+not in the code that either reviewer can read; it is in whether the installed
+CLIs accept these exact invocations. That evidence can only come from the target
+machine.

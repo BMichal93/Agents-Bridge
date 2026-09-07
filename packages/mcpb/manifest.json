@@ -3,9 +3,9 @@
   "manifest_version": "0.4",
   "name": "agent-bridge",
   "display_name": "Agent Bridge (Codex)",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "description": "Ask OpenAI Codex questions and delegate coding work to it from Claude.",
-  "long_description": "Adds tools for asking Codex for a second opinion, delegating implementation, running bounded independent Codex jobs, retaining project context and consulting Claude Code in the reverse direction. Questions isolate user configuration; Claude reviews use restricted and bare modes. Local delegations use Codex's workspace-write sandbox. Remote HTTP delegations stay read-only unless remote writes are explicitly enabled. Results include fingerprinted working-tree observations, including changes to already-dirty files. Requires the Codex CLI installed and signed in; ask_claude also requires Claude Code 2.1.248 or newer.",
+  "long_description": "Adds tools for asking Codex for a second opinion, delegating implementation, running bounded independent Codex jobs, retaining project context and consulting Claude Code in the reverse direction. Questions isolate user configuration; Claude reviews use restricted and bare modes. Local delegations use Codex's workspace-write sandbox. Remote HTTP delegations stay read-only unless remote writes are explicitly enabled. Results include fingerprinted working-tree observations, including changes to already-dirty files. Requires the Codex CLI installed and signed in; ask_claude also requires Claude Code 2.1.248 or newer. Both are found automatically, on PATH or in their usual install locations, so neither has to be configured.",
   "author": {
     "name": "Michal Budziszewski"
   },
@@ -48,15 +48,15 @@
     "codex_path": {
       "type": "string",
       "title": "Codex command",
-      "description": "Leave as codex unless it is not on your PATH, in which case give the full path.",
-      "default": "codex",
+      "description": "Leave blank to find Codex automatically: PATH first, then the usual install locations and the ChatGPT and Codex apps. Give a full path only to override that.",
+      "default": "",
       "required": false
     },
     "claude_path": {
       "type": "string",
       "title": "Claude Code command",
-      "description": "Leave as claude unless it is not on your PATH.",
-      "default": "claude",
+      "description": "Leave blank to find Claude Code automatically: PATH first, then the usual install locations and the Claude app. Give a full path only to override that.",
+      "default": "",
       "required": false
     }
   },

@@ -2,7 +2,7 @@
   "name": "agent-bridge",
   "displayName": "Agent Bridge: delegate to Codex",
   "description": "Let Claude and Copilot hand coding work to OpenAI Codex, and ask it for second opinions. Install and it works until you disable it.",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "publisher": "mbudziszewski",
   "license": "MIT",
   "engines": {
@@ -52,6 +52,10 @@
       {
         "command": "agentBridge.toggleConserve",
         "title": "Agent Bridge: Toggle conserve mode (push more work to Codex)"
+      },
+      {
+        "command": "agentBridge.detectAgents",
+        "title": "Agent Bridge: Detect installed agents"
       }
     ],
     "configuration": {
@@ -69,13 +73,13 @@
         },
         "agentBridge.codexPath": {
           "type": "string",
-          "default": "codex",
-          "description": "Full path to the codex command, if it is not on your PATH."
+          "default": "",
+          "description": "Full path to the codex command. Leave blank to detect it automatically: PATH first, then the usual install locations and the ChatGPT and Codex apps. Set this only to override what detection finds."
         },
         "agentBridge.claudePath": {
           "type": "string",
-          "default": "claude",
-          "description": "Full path to the claude command, if it is not on your PATH."
+          "default": "",
+          "description": "Full path to the claude command. Leave blank to detect it automatically: PATH first, then the usual install locations and the Claude app. Set this only to override what detection finds."
         }
       }
     }

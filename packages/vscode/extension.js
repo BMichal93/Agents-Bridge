@@ -67,8 +67,11 @@ function syncSettings() {
   const settings = {
     defaultProject: cfg.get("defaultProject") || workspace,
     conserveMode: Boolean(cfg.get("conserveMode")),
-    codexPath: cfg.get("codexPath") || "codex",
-    claudePath: cfg.get("claudePath") || "claude",
+    // Blank means "detect it". Writing "codex" here instead would look like a
+    // configured path to the server and switch detection off for everyone who
+    // never opened the settings.
+    codexPath: cfg.get("codexPath") || "",
+    claudePath: cfg.get("claudePath") || "",
   };
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -237,24 +240,59 @@ function env() {
   return {
     AGENT_BRIDGE_DEFAULT_CWD: cfg.get("defaultProject") || workspace,
     AGENT_BRIDGE_CONSERVE: cfg.get("conserveMode") ? "1" : "0",
-    AGENT_BRIDGE_CODEX_BIN: cfg.get("codexPath") || "codex",
-    AGENT_BRIDGE_CLAUDE_BIN: cfg.get("claudePath") || "claude",
+    AGENT_BRIDGE_CODEX_BIN: cfg.get("codexPath") || "",
+    AGENT_BRIDGE_CLAUDE_BIN: cfg.get("claudePath") || "",
   };
 }
 
-/** Run a CLI. Windows needs cmd.exe because both CLIs install as .cmd shims. */
+/**
+ * Run a CLI. Windows needs cmd.exe for the .cmd shims these install as, but a
+ * real .exe is spawned directly: detection returns absolute paths, and an
+ * absolute path with a space in it does not survive being pasted into a cmd
+ * command line. This mirrors launchSpec() in the server; keep the two in step.
+ */
 function run(bin, args) {
-  const isWindows = process.platform === "win32";
-  if (isWindows && [bin, ...args].some((value) => /[&|<>^%!()"\r\n]/.test(value))) {
+  const needsShell = process.platform === "win32" && !/\.exe$/i.test(bin);
+  if (needsShell && [bin, ...args].some((value) => /[&|<>^%!()"\r\n]/.test(value))) {
     return { ok: false, out: "refused command containing Windows shell metacharacters" };
   }
-  const file = isWindows ? process.env.ComSpec || "cmd.exe" : bin;
-  const argv = isWindows ? ["/d", "/s", "/c", bin, ...args] : args;
+  const file = needsShell ? process.env.ComSpec || "cmd.exe" : bin;
+  const argv = needsShell ? ["/d", "/s", "/c", bin, ...args] : args;
   const r = cp.spawnSync(file, argv, { encoding: "utf8", timeout: 60000 });
   return { ok: r.status === 0, out: `${r.stdout || ""}${r.stderr || ""}`.trim() };
 }
 
 const cliInstalled = (bin) => run(bin, ["--version"]).ok;
+
+/**
+ * Where the CLIs are, according to the server.
+ *
+ * The extension host is the worst possible place to look for them: VS Code
+ * launched from a dock or a Start menu inherits the login environment, not the
+ * shell one, so `codex` is routinely absent from PATH here while working
+ * perfectly in a terminal two inches away. That is why this asks the server,
+ * which searches the real install locations, instead of running `codex
+ * --version` and believing the answer.
+ */
+function detectAgents(context) {
+  const result = cp.spawnSync(process.execPath, [serverPath(context), "--detect"], {
+    encoding: "utf8",
+    timeout: 120000,
+  });
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** The command to launch, preferring an explicit setting over detection. */
+function resolvedPath(cfg, detected, kind) {
+  const setting = cfg.get(kind === "codex" ? "codexPath" : "claudePath");
+  if (setting) return setting;
+  const agent = detected?.agents?.[kind];
+  return agent?.found ? agent.path : kind;
+}
 
 function applyToClis(context, enable) {
   const cfg = vscode.workspace.getConfiguration("agentBridge");
@@ -262,9 +300,10 @@ function applyToClis(context, enable) {
   const done = [];
   const skipped = [];
 
+  const detected = detectAgents(context);
   const hosts = [
-    { label: "Codex", bin: cfg.get("codexPath") || "codex", add: ["mcp", "add", SERVER_NAME, "--", "node", target], remove: ["mcp", "remove", SERVER_NAME] },
-    { label: "Claude Code", bin: cfg.get("claudePath") || "claude", add: ["mcp", "add", SERVER_NAME, "-s", "user", "--", "node", target], remove: ["mcp", "remove", SERVER_NAME, "-s", "user"] },
+    { label: "Codex", bin: resolvedPath(cfg, detected, "codex"), add: ["mcp", "add", SERVER_NAME, "--", "node", target], remove: ["mcp", "remove", SERVER_NAME] },
+    { label: "Claude Code", bin: resolvedPath(cfg, detected, "claude"), add: ["mcp", "add", SERVER_NAME, "-s", "user", "--", "node", target], remove: ["mcp", "remove", SERVER_NAME, "-s", "user"] },
   ];
 
   for (const host of hosts) {
@@ -404,6 +443,42 @@ function activate(context) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("agentBridge.detectAgents", async () => {
+      const detected = detectAgents(context);
+      if (!detected) {
+        vscode.window.showWarningMessage("Agent Bridge: detection did not return a result.");
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration("agentBridge");
+      const items = [];
+      for (const kind of ["codex", "claude"]) {
+        const agent = detected.agents[kind];
+        const setting = cfg.get(kind === "codex" ? "codexPath" : "claudePath");
+        items.push({
+          label: `$(${agent.found || setting ? "check" : "circle-slash"}) ${agent.label}`,
+          description: setting || (agent.found ? agent.version : "not found"),
+          detail: setting
+            ? `Set by ${kind === "codex" ? "codexPath" : "claudePath"}; detection is not used.`
+            : agent.found
+              ? `${agent.path} (found via ${agent.source})`
+              : `Searched PATH and ${agent.searched - 1} install locations. Install with \`${agent.install}\`.`,
+        });
+        // A desktop app is worth naming even though it cannot be delegated to,
+        // because "the app is right there" is exactly why a missing CLI is
+        // confusing.
+        for (const app of agent.apps) {
+          items.push({
+            label: `$(info) ${app.name} app`,
+            description: "installed",
+            detail:
+              agent.found && agent.source === `${app.name} app`
+                ? `${app.dir} - its bundled ${agent.command} is the one in use.`
+                : `${app.dir} - a chat UI with no automation entry point, so the ${agent.command} CLI is used instead.`,
+          });
+        }
+      }
+      await vscode.window.showQuickPick(items, { title: "Agent Bridge: detected agents" });
+    }),
     vscode.commands.registerCommand("agentBridge.enableForClis", () => applyToClis(context, true)),
     vscode.commands.registerCommand("agentBridge.disableForClis", () => applyToClis(context, false)),
     vscode.commands.registerCommand("agentBridge.showStatus", async () => {
@@ -412,6 +487,7 @@ function activate(context) {
       const pick = await vscode.window.showQuickPick(
         [
           { label: conserve ? "Turn conserve mode off" : "Turn conserve mode on", id: "conserve" },
+          { label: "Show detected agents", id: "detect" },
           { label: "Enable for Codex and Claude Code", id: "enable" },
           { label: "Remove from Codex and Claude Code", id: "disable" },
           { label: "Open Agent Bridge settings", id: "settings" },
@@ -419,6 +495,7 @@ function activate(context) {
         { title: "Agent Bridge" }
       );
       if (pick?.id === "conserve") await vscode.commands.executeCommand("agentBridge.toggleConserve");
+      if (pick?.id === "detect") await vscode.commands.executeCommand("agentBridge.detectAgents");
       if (pick?.id === "enable") applyToClis(context, true);
       if (pick?.id === "disable") applyToClis(context, false);
       if (pick?.id === "settings") vscode.commands.executeCommand("workbench.action.openSettings", "agentBridge");
@@ -443,8 +520,12 @@ function activate(context) {
     context.globalState.update(OFFERED_KEY, true);
     const present = [];
     const cfg = vscode.workspace.getConfiguration("agentBridge");
-    if (cliInstalled(cfg.get("codexPath") || "codex")) present.push("Codex");
-    if (cliInstalled(cfg.get("claudePath") || "claude")) present.push("Claude Code");
+    const detected = detectAgents(context);
+    for (const kind of ["codex", "claude"]) {
+      const setting = cfg.get(kind === "codex" ? "codexPath" : "claudePath");
+      const label = kind === "codex" ? "Codex" : "Claude Code";
+      if (setting ? cliInstalled(setting) : detected?.agents?.[kind]?.found) present.push(label);
+    }
     if (present.length) {
       vscode.window
         .showInformationMessage(

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.11
+
+- Find Codex and Claude Code automatically instead of requiring them on PATH.
+  The bridge is launched by a host that inherits the login environment rather
+  than a shell's, so a CLI that works in a terminal is routinely invisible to
+  the process that has to spawn it. Resolution is now: an explicit setting, then
+  PATH, then the standard install locations for each CLI, then inside an
+  installed ChatGPT, Codex or Claude desktop app. Every candidate is verified by
+  running `--version` rather than trusted from its path, and the result is
+  remembered in `~/.agent-bridge/discovered.json`.
+- An explicit `codexPath`, `claudePath` or `AGENT_BRIDGE_*_BIN` is still used
+  exactly as given and is never substituted, so a stale setting fails visibly.
+- Detect the ChatGPT and Claude desktop apps, and use a CLI bundled inside one.
+  The apps themselves are not delegated to: they are chat UIs with no automation
+  entry point. They are named in the "not installed" message so that having the
+  app open while the CLI is missing stops being a contradiction.
+- `agent-bridge.mjs --detect` prints the resolved locations. The doctor and the
+  VS Code extension both call it rather than searching separately, so neither
+  can report a different install from the one that would be launched.
+- Windows launches a `.exe` directly instead of through cmd.exe, which removes
+  the shell-metacharacter restriction for native installs. A `.cmd` shim in a
+  path containing `&|<>^%!()"` is still refused, and is now reported as present
+  and unlaunchable rather than as missing.
+- New settings: `AGENT_BRIDGE_CLI_SEARCH_PATH`, `AGENT_BRIDGE_APP_SEARCH_PATH`,
+  `AGENT_BRIDGE_REFRESH_CLIS`. `agentBridge.codexPath` and
+  `agentBridge.claudePath` now default to blank, meaning detect.
+
 ## 0.9.10
 
 - The `--no-session-persistence` fallback now discloses its privacy consequence

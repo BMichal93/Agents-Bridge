@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "private": true,
   "type": "module",
   "description": "Delegate coding work to OpenAI Codex from Claude and Copilot, and ask it for second opinions.",

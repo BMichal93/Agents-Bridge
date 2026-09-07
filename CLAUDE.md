@@ -7,6 +7,7 @@ the two bundles that install it.
 
 ```
 src/agent-bridge.mjs        the MCP server. One file, zero dependencies.
+                            `--detect` prints resolved CLI locations and exits.
 packages/mcpb/              Claude Desktop bundle (manifest.json)
 packages/vscode/            VS Code extension (package.json, extension.js)
 scripts/build.mjs           copies src/ into both packages and packs them
@@ -45,10 +46,27 @@ the server's `SERVER_VERSION`, so the order you run them in does not matter.
 `console.log` corrupts the JSON-RPC stream and the host silently drops the
 connection.
 
-**Windows spawning.** `claude` and `codex` install as `.cmd` shims, which Node
-cannot spawn directly, so on Windows everything goes through `cmd.exe /d /s /c`.
-Every argument handed to cmd.exe must be a literal from the source, never text
-from a model.
+**Windows spawning.** `claude` and `codex` often install as `.cmd` shims, which
+Node cannot spawn directly, so those go through `cmd.exe /d /s /c`. Every
+argument handed to cmd.exe must be a literal from the source, never text from a
+model. A `.exe` needs no shell and is spawned directly, which is why discovery
+prefers it: it is the only form that survives a path containing a space or a
+parenthesis. `launchSpec()` makes that decision in one place; use it rather than
+rebuilding the cmd.exe argv, and keep it returning null (not a best effort) when
+a path cannot be passed safely.
+
+**CLI locations are discovered, not assumed.** The bridge is spawned by a host
+that inherits the login environment, so PATH is frequently missing the CLIs that
+work fine in a terminal. `resolveCli()` tries an explicit setting, then PATH,
+then per-platform install directories, then inside a detected desktop app, and
+verifies every candidate by running `--version`. That verification is what lets
+the candidate list stay generous: a wrong entry costs one failed spawn. An
+explicit setting is used exactly as given and must never be replaced by a
+discovered one - a stale path has to fail visibly or it outlives the session.
+Detection has exactly one implementation, exposed as `--detect`; the doctor and
+the VS Code extension spawn it rather than searching for themselves, because a
+doctor that reports a different install from the one being launched is worse
+than no doctor.
 
 **The prompt goes on stdin, never argv.** Prompts contain quotes, `%`, `&` and
 `^`, all meaningful to cmd.exe, and argv has a length limit a forwarded diff will
@@ -109,6 +127,12 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
 
 ## What this deliberately does not do
 
+- **Delegate to the ChatGPT or Claude desktop apps.** They are detected, and a
+  CLI bundled inside one is used, but they are chat UIs with no automation entry
+  point. The workarounds are scripting the GUI, which is unreliable, and reusing
+  the app's session token, which is a credential grab this deliberately does not
+  do. Detection exists so the "not installed" message can say the app is present
+  and the CLI is a separate install.
 - **Read Claude's remaining usage.** No supported route exists; nothing in MCP
   exposes the calling session's budget. Conserve mode is a switch the user flips,
   not a detection. Do not add a scraped version without labelling it as a guess in

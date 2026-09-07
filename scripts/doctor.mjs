@@ -14,9 +14,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const IS_WINDOWS = process.platform === "win32";
-const CODEX = process.env.AGENT_BRIDGE_CODEX_BIN || "codex";
-const CLAUDE = process.env.AGENT_BRIDGE_CLAUDE_BIN || "claude";
+const SERVER = fileURLToPath(new URL("../src/agent-bridge.mjs", import.meta.url));
 const LIVE = !process.argv.includes("--no-live");
+
+/**
+ * Ask the server where the CLIs are, rather than looking for them here.
+ *
+ * A doctor that searches independently will eventually disagree with the server
+ * about which binary is in use, and a doctor that reports a different install
+ * from the one being launched is worse than no doctor at all. `--detect` is the
+ * server's own resolution, printed.
+ */
+function detect() {
+  const result = spawnSync(process.execPath, [SERVER, "--detect"], { encoding: "utf8", timeout: 120_000 });
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+const detected = detect();
+// An explicit override still wins, exactly as it does in the server.
+const CODEX = process.env.AGENT_BRIDGE_CODEX_BIN || detected?.agents?.codex?.path || "codex";
+const CLAUDE = process.env.AGENT_BRIDGE_CLAUDE_BIN || detected?.agents?.claude?.path || "claude";
 
 const results = [];
 const pass = (name, detail = "") => results.push({ state: "pass", name, detail });
@@ -169,8 +190,52 @@ function probeClaudeBridge(cwd) {
   });
 }
 
+function reportDetection() {
+  if (!detected) {
+    fail("cli detection", "`agent-bridge.mjs --detect` did not return a result");
+    return;
+  }
+  for (const kind of ["codex", "claude"]) {
+    const agent = detected.agents[kind];
+    const override = process.env[kind === "codex" ? "AGENT_BRIDGE_CODEX_BIN" : "AGENT_BRIDGE_CLAUDE_BIN"];
+    if (override) {
+      pass(`${kind} location`, `${override} (set by environment)`);
+    } else if (agent.found) {
+      pass(`${kind} location`, `${agent.path} (${agent.source})`);
+    } else if (agent.blocked?.length) {
+      // Present, and refused. Saying "not found" here would send someone
+      // hunting for a file they are looking straight at.
+      fail(
+        `${kind} location`,
+        `${agent.blocked[0]} exists but its path contains Windows shell metacharacters, so it will not be launched; ` +
+          `set ${agent.setting} to a path without them`
+      );
+    } else {
+      // Not a failure: half a bridge is a supported setup. One direction works.
+      skip(
+        `${kind} location`,
+        `not found on PATH or in ${agent.searched - 1} install locations; install with \`${agent.install}\` ` +
+          `or set ${agent.setting}`
+      );
+    }
+    // The desktop apps cannot be delegated to. Saying so here is the whole point:
+    // "I have the ChatGPT app, why is Codex missing" is the common confusion.
+    for (const app of agent.apps) {
+      const bundled = agent.found && agent.source === `${app.name} app`;
+      skip(
+        `${app.name} app`,
+        bundled
+          ? `installed at ${app.dir}; its bundled ${agent.command} is the one in use`
+          : `installed at ${app.dir}; it is a chat UI with no automation entry point, so the ${agent.command} CLI is used instead`
+      );
+    }
+  }
+}
+
 async function main() {
   console.log("agent-bridge doctor\n");
+
+  reportDetection();
 
   const codexVersion = version(CODEX);
   if (!codexVersion) {

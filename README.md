@@ -22,7 +22,8 @@ across related tasks.
 ## Requirements
 
 - Node.js 18 or newer.
-- OpenAI Codex CLI installed and signed in with `codex login`.
+- OpenAI Codex CLI installed and signed in with `codex login`. It does not have
+  to be on your PATH; see [Finding the CLIs](#finding-the-clis).
 - Claude Code 2.1.248 or newer, installed and signed in, if you want Codex or
   VS Code to use `ask_claude`. That version introduced restricted mode.
 - A Git repository is strongly recommended so the bridge can report the working
@@ -32,7 +33,7 @@ across related tasks.
 
 ### Claude Desktop
 
-1. Download `agent-bridge-0.9.10.mcpb` from Releases.
+1. Download `agent-bridge-0.9.11.mcpb` from Releases.
 2. Double-click it, or drag it into **Settings > Extensions**.
 3. Set **Default project folder** if requests will not always include an
    absolute `cwd`.
@@ -44,7 +45,7 @@ the local Codex CLI.
 ### VS Code, Claude Code and Codex CLI
 
 1. In VS Code, open **Extensions > ... > Install from VSIX**.
-2. Select `agent-bridge-0.9.10.vsix`.
+2. Select `agent-bridge-0.9.11.vsix`.
 3. Accept the one-time offer to enable the bridge for the Codex and Claude Code
    CLIs. You can run **Agent Bridge: Enable for Codex and Claude Code** later if
    you initially decline.
@@ -200,6 +201,59 @@ closure, not an unrelated POST naming the same JSON-RPC ID. Background work
 outlives its start/collect request until the MCP host shuts down. A cancelled
 collection leaves its results available for another collection attempt.
 
+## Finding the CLIs
+
+You should not have to tell the bridge where Codex and Claude Code are, and
+usually you do not.
+
+The bridge is started by whichever host you registered it with, and a host
+launched from a dock or a Start menu inherits the login environment rather than
+your shell's. `~/.local/bin`, a Homebrew prefix and an npm global prefix are all
+routinely missing from it, which is why a CLI that works perfectly in a terminal
+can be invisible to the process that has to launch it. So the bridge looks for
+itself:
+
+1. An explicit setting, if you have one: `agentBridge.codexPath`,
+   `agentBridge.claudePath`, or the `AGENT_BRIDGE_*_BIN` variables. This is used
+   exactly as given and is never silently replaced, so a stale path fails
+   visibly instead of being papered over.
+2. PATH.
+3. The usual install locations for each CLI: `~/.local/bin`, `~/.codex/bin`,
+   `~/.claude/local`, `~/.cargo/bin`, a Homebrew prefix, the npm global prefix
+   next to the running Node, and on Windows `%LOCALAPPDATA%\Programs`,
+   `%APPDATA%\npm` and the WinGet links directory.
+4. Inside an installed ChatGPT, Codex or Claude desktop app, in case it ships a
+   CLI of its own.
+
+Every candidate is verified by running `--version`, not by trusting the path, so
+a location that does not apply to your machine costs one failed launch and
+nothing else. The first one that answers is used, remembered in
+`~/.agent-bridge/discovered.json`, and reused without probing until it goes
+away.
+
+To see what it found:
+
+```text
+node ~/.agent-bridge/agent-bridge.mjs --detect
+```
+
+`npm run doctor` reports the same thing, and in VS Code the command is
+**Agent Bridge: Detect installed agents**. Set `AGENT_BRIDGE_REFRESH_CLIS=1` to
+ignore what was remembered and search again.
+
+### The desktop apps are detected, not driven
+
+The ChatGPT and Claude desktop apps are found if you have them, and a CLI
+bundled inside one is used. The apps themselves are not, and cannot be, used as
+delegates: they are chat UIs with no automation entry point, and the workarounds
+(scripting the GUI, or reusing the app's session token) are respectively
+unreliable and a credential grab. Detecting them is what lets a missing CLI say
+"the ChatGPT app is installed, but the CLI is a separate install" instead of
+just "not installed".
+
+So if `ask_codex` reports that Codex is missing while the ChatGPT app is open in
+front of you, both things are true, and the fix is `npm install -g @openai/codex`.
+
 ## Failure behavior
 
 - A non-zero CLI exit is returned as an error even if the CLI printed a partial
@@ -237,8 +291,11 @@ first four for you.
 | --- | --- | --- |
 | `AGENT_BRIDGE_DEFAULT_CWD` | unset | Folder used when a request does not name one |
 | `AGENT_BRIDGE_CONSERVE` | unset | `1` turns on conserve mode |
-| `AGENT_BRIDGE_CODEX_BIN` | `codex` | Full path if it is not on PATH |
-| `AGENT_BRIDGE_CLAUDE_BIN` | `claude` | Full path if it is not on PATH |
+| `AGENT_BRIDGE_CODEX_BIN` | unset | Full path to `codex`; overrides detection |
+| `AGENT_BRIDGE_CLAUDE_BIN` | unset | Full path to `claude`; overrides detection |
+| `AGENT_BRIDGE_CLI_SEARCH_PATH` | unset | Extra directories to search, `PATH`-separated |
+| `AGENT_BRIDGE_APP_SEARCH_PATH` | unset | Extra directories to search for installed desktop apps |
+| `AGENT_BRIDGE_REFRESH_CLIS` | unset | `1` ignores the remembered locations and searches again |
 | `AGENT_BRIDGE_TIMEOUT_MS` | `300000` | Timeout for `ask_` tools |
 | `AGENT_BRIDGE_DELEGATE_TIMEOUT_MS` | `1800000` | Timeout for delegations and jobs |
 | `AGENT_BRIDGE_MAX_REPLY_CHARS` | `6000` | Trim a long peer reply before it reaches the caller |
@@ -302,6 +359,11 @@ exact API billing.
 npm run doctor
 ```
 
+`doctor` opens with where it found each CLI and which desktop apps are
+installed, then checks the flags. The locations come from the server's own
+`--detect`, so the doctor cannot report a different install from the one that
+would actually be launched.
+
 The test suite uses stub CLIs, so it cannot prove that installed CLIs accept the
 real flags. `doctor` treats help output as advisory, then makes exact read-only
 Codex and Claude calls, validates Codex JSONL/thread IDs, and probes the Codex
@@ -331,7 +393,12 @@ packages. See `CLAUDE.md` for maintenance constraints and
 ## Limits
 
 - Delegation reaches the local Codex CLI, using its configured account and
-  model. It is not an API for controlling an open ChatGPT conversation.
+  model. It is not an API for controlling an open ChatGPT conversation. The
+  ChatGPT and Claude desktop apps are detected, and a CLI bundled inside one is
+  used, but the apps themselves cannot be delegated to.
+- On Windows a `.cmd` shim whose path contains `&|<>^%!()"` cannot be launched
+  through the command shell and is reported rather than used; a `.exe` is
+  launched directly and has no such restriction.
 - Background scheduling and lane locks coordinate one Agent Bridge process.
   Separate MCP hosts can launch separate bridge processes and require normal
   repository/worktree isolation if they write concurrently.

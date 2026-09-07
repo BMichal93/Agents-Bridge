@@ -33,7 +33,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.10";
+const SERVER_VERSION = "0.9.11";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -70,6 +70,7 @@ const STATE_DIR = path.join(os.homedir(), ".agent-bridge");
 const MODELS_FILE = path.join(STATE_DIR, "models.json");
 const CONSERVE_FILE = path.join(STATE_DIR, "conserve");
 const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
+const DISCOVERY_FILE = path.join(STATE_DIR, "discovered.json");
 
 function loadSettings() {
   try {
@@ -80,8 +81,365 @@ function loadSettings() {
 }
 
 const savedSettings = loadSettings();
-const CLAUDE_BIN = process.env.AGENT_BRIDGE_CLAUDE_BIN || savedSettings.claudePath || "claude";
-const CODEX_BIN = process.env.AGENT_BRIDGE_CODEX_BIN || savedSettings.codexPath || "codex";
+// ---------------------------------------------------------------------------
+// Finding Codex and Claude
+// ---------------------------------------------------------------------------
+/**
+ * Neither CLI is reliably on PATH by the time this process sees it.
+ *
+ * The bridge is started by whatever host it was registered with, and hosts do
+ * not agree on the environment they hand a child. A desktop app launched from
+ * Finder or the Start menu inherits the login environment rather than the shell
+ * one, so `~/.local/bin`, a Homebrew prefix and an npm global prefix are all
+ * routinely missing. That is the whole of the "it works in my terminal but not
+ * in the app" report, and with a bare `codex` in argv it surfaces as the least
+ * helpful possible message: it does not look installed.
+ *
+ * So: try the bare name first, which is one spawn and is exactly what used to
+ * happen, then walk the places these two actually install to, and verify every
+ * candidate by running it rather than by trusting the path. A wrong guess in
+ * the search list costs one failed `--version` and nothing else, which is why
+ * the list can afford locations that only some installs use.
+ *
+ * What this deliberately does NOT do is drive the ChatGPT or Claude desktop
+ * apps. They are chat UIs with no automation entry point: there is no supported
+ * way to hand one a prompt and read its answer, and the alternatives (scripting
+ * the GUI, reusing the app's session token) are respectively unreliable and a
+ * credential grab. They are detected so that a missing CLI can say "the ChatGPT
+ * app is installed, but the CLI is a separate install" instead of leaving you
+ * to guess, and so that a CLI bundled inside an app can be found and used.
+ */
+
+const safeForWindowsCmd = (value) => !/[&|<>^%!()"\r\n]/.test(value);
+
+/**
+ * `.cmd` and `.bat` shims cannot be spawned by Node directly, so they go through
+ * cmd.exe, and then every argument has to survive cmd's parsing. A real `.exe`
+ * needs no shell at all: spawning it directly is both safer and the only way to
+ * launch a discovered path containing a space or a parenthesis, which is most
+ * of `C:\Program Files (x86)`.
+ */
+const needsWindowsShell = (bin) => IS_WINDOWS && !/\.exe$/i.test(bin);
+
+/** How to spawn `bin args`, or null when cmd.exe could not be given it safely. */
+function launchSpec(bin, args) {
+  if (!needsWindowsShell(bin)) return { file: bin, argv: args };
+  if (![bin, ...args].every(safeForWindowsCmd)) return null;
+  return { file: process.env.ComSpec || "cmd.exe", argv: ["/d", "/s", "/c", bin, ...args] };
+}
+
+const AGENTS = {
+  codex: {
+    label: "Codex",
+    command: "codex",
+    setting: "codexPath",
+    envVar: "AGENT_BRIDGE_CODEX_BIN",
+    install: "npm install -g @openai/codex",
+    // Desktop apps that ship or accompany this CLI. Detected for diagnostics,
+    // and searched for a bundled binary; never delegated to. See above.
+    apps: ["ChatGPT", "Codex"],
+  },
+  claude: {
+    label: "Claude Code",
+    command: "claude",
+    setting: "claudePath",
+    envVar: "AGENT_BRIDGE_CLAUDE_BIN",
+    install: "npm install -g @anthropic-ai/claude-code",
+    apps: ["Claude", "AnthropicClaude"],
+  },
+};
+
+const splitPathList = (value) =>
+  (value || "").split(path.delimiter).map((entry) => entry.trim()).filter(Boolean);
+
+const isDirectory = (target) => {
+  try {
+    return fs.statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+const isFile = (target) => {
+  try {
+    return fs.statSync(target).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/** Where these two put themselves, per platform. Order is preference order. */
+function cliSearchDirs(kind) {
+  const home = os.homedir();
+  const dirs = splitPathList(process.env.AGENT_BRIDGE_CLI_SEARCH_PATH);
+  if (IS_WINDOWS) {
+    const local = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    const roaming = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    dirs.push(
+      path.join(local, "Programs", AGENTS[kind].command),
+      path.join(roaming, "npm"),
+      path.join(local, "Microsoft", "WinGet", "Links"),
+      path.join(process.env.ProgramFiles || "C:\\Program Files", AGENTS[kind].command),
+      path.join(home, ".local", "bin")
+    );
+  } else {
+    dirs.push(
+      path.join(home, ".local", "bin"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      path.join(home, ".bun", "bin"),
+      path.join(home, ".volta", "bin")
+    );
+  }
+  if (kind === "codex") dirs.push(path.join(home, ".codex", "bin"), path.join(home, ".cargo", "bin"));
+  else dirs.push(path.join(home, ".claude", "local"), path.join(home, ".claude", "bin"));
+  // The prefix this Node came from: an `npm install -g` lands beside it, which
+  // covers the case where the host bundles its own Node and its own PATH.
+  const nodeDir = path.dirname(process.execPath);
+  dirs.push(nodeDir, path.join(path.dirname(nodeDir), "bin"));
+  return [...new Set(dirs)];
+}
+
+/** Subdirectories of an installed desktop app that could hold a bundled CLI. */
+const APP_BIN_SUBDIRS = [
+  "",
+  "bin",
+  "Contents/MacOS",
+  "Contents/Resources",
+  "Contents/Resources/bin",
+  "Contents/Resources/app/bin",
+  "Contents/Resources/app.asar.unpacked/bin",
+  "resources",
+  "resources/bin",
+  "resources/app/bin",
+];
+
+/** Desktop apps that are installed, whether or not they carry a usable CLI. */
+function detectApps(kind) {
+  const home = os.homedir();
+  const containers = splitPathList(process.env.AGENT_BRIDGE_APP_SEARCH_PATH);
+  if (process.platform === "darwin") {
+    containers.push("/Applications", path.join(home, "Applications"));
+  } else if (IS_WINDOWS) {
+    const local = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    containers.push(path.join(local, "Programs"), local, process.env.ProgramFiles || "C:\\Program Files");
+  } else {
+    containers.push("/opt", "/usr/share", path.join(home, ".local", "share"));
+  }
+
+  const apps = [];
+  for (const container of [...new Set(containers)]) {
+    for (const name of AGENTS[kind].apps) {
+      // macOS apps are directories ending in .app; everywhere else they are a
+      // plain install directory named after the product.
+      const dir = path.join(container, process.platform === "darwin" ? `${name}.app` : name);
+      if (isDirectory(dir) && !apps.some((app) => app.dir === dir)) apps.push({ name, dir });
+    }
+  }
+  return apps;
+}
+
+/** `.exe` first: it is the one Windows form that needs no shell to launch. */
+const cliFileNames = (command) =>
+  IS_WINDOWS ? [`${command}.exe`, `${command}.cmd`, `${command}.bat`, command] : [command];
+
+/**
+ * Verify a candidate by running it.
+ *
+ * Deciding from the path alone would turn a wrong entry in the search list into
+ * a broken install that reports itself as working. Running `--version` makes a
+ * wrong entry cost one failed spawn, which is the property that lets the list
+ * stay generous.
+ */
+function probeCli(bin) {
+  const spec = launchSpec(bin, ["--version"]);
+  if (!spec) return null;
+  try {
+    const result = spawnSync(spec.file, spec.argv, { encoding: "utf8", timeout: 15_000, windowsHide: true });
+    if (result.status !== 0) return null;
+    const first = `${result.stdout || ""}${result.stderr || ""}`.trim().split("\n")[0].trim();
+    return first.slice(0, 80) || "installed";
+  } catch {
+    return null;
+  }
+}
+
+function discoverCli(kind) {
+  const agent = AGENTS[kind];
+  const apps = detectApps(kind);
+
+  // PATH first. One spawn, it is what a correctly set up machine hits, and it
+  // keeps the common case exactly as cheap as it was before any of this.
+  const onPath = probeCli(agent.command);
+  if (onPath) return { path: agent.command, source: "PATH", version: onPath, found: true, searched: 1, apps };
+
+  const roots = cliSearchDirs(kind).map((dir) => ({ dir, source: dir }));
+  for (const app of apps) {
+    for (const sub of APP_BIN_SUBDIRS) {
+      roots.push({ dir: path.join(app.dir, ...sub.split("/").filter(Boolean)), source: `${app.name} app` });
+    }
+  }
+
+  const searched = roots.length + 1;
+  // Candidates that are plainly there but cannot be launched. On Windows a
+  // `.cmd` shim under a path like "C:\\Program Files (x86)" has to go through
+  // cmd.exe, and its parentheses mean something to cmd, so the bridge refuses
+  // it. Reporting that as a plain "not found" would send someone hunting for a
+  // file they are looking straight at.
+  const blocked = [];
+  for (const root of roots) {
+    for (const name of cliFileNames(agent.command)) {
+      const candidate = path.join(root.dir, name);
+      if (!isFile(candidate)) continue;
+      if (!launchSpec(candidate, ["--version"])) {
+        blocked.push(candidate);
+        continue;
+      }
+      const version = probeCli(candidate);
+      if (version) return { path: candidate, source: root.source, version, found: true, searched, apps, blocked };
+    }
+  }
+  return { path: agent.command, source: "not found", version: "", found: false, searched, apps, blocked };
+}
+
+const loadDiscovered = () => {
+  try {
+    return JSON.parse(fs.readFileSync(DISCOVERY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+};
+
+/** Remember it, so the next session costs no probes at all. */
+function saveDiscovered(kind, value) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const all = loadDiscovered();
+    all[kind] = { path: value.path, source: value.source, version: value.version, at: new Date().toISOString() };
+    const temporary = `${DISCOVERY_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(all, null, 2));
+    fs.renameSync(temporary, DISCOVERY_FILE);
+  } catch {}
+}
+
+const DETECT_MODE = process.argv.includes("--detect");
+const REFRESH_CLIS = DETECT_MODE || process.env.AGENT_BRIDGE_REFRESH_CLIS === "1";
+const resolvedClis = new Map();
+
+/**
+ * An explicit setting, if there is one.
+ *
+ * The shipped default for both settings is the bare command name, and the VS
+ * Code extension used to write that into settings.json for everyone who never
+ * opened the settings, so "codex" has to mean "not configured" or detection
+ * would be off by default on every existing install.
+ */
+function configuredCli(kind) {
+  const agent = AGENTS[kind];
+  const value = (process.env[agent.envVar] || savedSettings[agent.setting] || "").trim();
+  if (!value || value === agent.command || value.toLowerCase() === "auto") return null;
+  return value;
+}
+
+/** What a previous session found, if it is still there. */
+function rememberedCli(kind) {
+  if (REFRESH_CLIS) return null;
+  const cached = loadDiscovered()[kind];
+  if (!cached?.path) return null;
+  // A bare command name means PATH, which cannot be stat'd; if it has since
+  // been uninstalled the launch fails and says so, exactly as it always did.
+  return cached.path === AGENTS[kind].command || isFile(cached.path) ? cached : null;
+}
+
+const known = (path, source, version) => ({ path, source, version, found: true, searched: 0, apps: [], blocked: [] });
+
+/**
+ * Resolve once per process, on first use rather than at startup, so a session
+ * that never delegates never pays for a probe.
+ */
+function resolveCli(kind) {
+  if (resolvedClis.has(kind)) return resolvedClis.get(kind);
+  const agent = AGENTS[kind];
+  const configured = configuredCli(kind);
+  const remembered = configured ? null : rememberedCli(kind);
+  let value;
+
+  if (configured) {
+    // An explicit path is used exactly as given, and a wrong one fails loudly.
+    // Quietly substituting a different install would hide a setting that no
+    // longer matches the machine, which is the bug that outlives the session.
+    value = known(configured, "configured", "");
+  } else if (remembered) {
+    value = known(remembered.path, `${remembered.source}, remembered`, remembered.version || "");
+  } else {
+    value = discoverCli(kind);
+    if (value.found) saveDiscovered(kind, value);
+    log(
+      value.found
+        ? `found ${agent.label} at ${value.path} (${value.source})`
+        : `${agent.label} CLI not found: searched PATH and ${value.searched - 1} install locations`
+    );
+  }
+
+  resolvedClis.set(kind, value);
+  // The startup warm-up declines to probe, so this may be the first moment the
+  // Codex path is known. The peer call that follows takes seconds; asking now
+  // means its reply usually still carries a usage figure. Not in --detect,
+  // which exits immediately and would leave the app-server child orphaned.
+  if (kind === "codex" && value.found && !DETECT_MODE) refreshUsage();
+  return value;
+}
+
+const codexBin = () => resolveCli("codex").path;
+const claudeBin = () => resolveCli("claude").path;
+
+/**
+ * The path we can name without spawning anything.
+ *
+ * Resolution probes candidates with spawnSync, which blocks the event loop.
+ * That is fine inside a tool call, which is about to spawn the CLI anyway, and
+ * not fine on the startup usage warm-up, which runs before the first request is
+ * read: a slow CLI would stall the MCP handshake for a status line. So the
+ * warm-up uses an explicit setting or a remembered location, and otherwise
+ * declines, falling back to the rollout logs exactly as it does when the
+ * app-server method is missing. The first tool call resolves properly and asks
+ * for usage again, so at most the first reply of a first-ever session is
+ * missing its usage figure.
+ */
+function peekCli(kind) {
+  return resolvedClis.get(kind)?.path || configuredCli(kind) || rememberedCli(kind)?.path || null;
+}
+
+/**
+ * The extra sentence a caller needs when a peer is simply not installed.
+ *
+ * Only produced on the failure path, so it costs nothing in the tool
+ * definitions, and it names the desktop app when one is present because "I have
+ * the ChatGPT app, why does it say Codex is missing" is the confusion this
+ * whole section exists to answer.
+ */
+function notInstalledAdvice(peer) {
+  const kind = peer === "Codex" ? "codex" : "claude";
+  const info = resolvedClis.get(kind);
+  if (!info || info.found) return "";
+  const agent = AGENTS[kind];
+  const apps = info.apps.map((app) => app.name).join(" and ");
+  if (info.blocked?.length) {
+    return (
+      ` ${agent.label} is installed at ${info.blocked[0]}, but that path contains characters that cannot be passed ` +
+      `through the Windows command shell safely, so the bridge will not launch it. Reinstall it somewhere without ` +
+      `\`&|<>^%!()"\` in the path, or set ${agent.setting} to a path without them.`
+    );
+  }
+  return (
+    ` The ${agent.label} CLI was not found on PATH or in ${info.searched - 1} standard install locations.` +
+    (apps
+      ? ` The ${apps} desktop app is installed, but it is a chat UI and does not provide a \`${agent.command}\` command; the CLI is a separate install.`
+      : "") +
+    ` Install it with \`${agent.install}\`, or set ${agent.setting} to its full path.`
+  );
+}
 
 /**
  * Effort tiers instead of model names.
@@ -195,7 +553,6 @@ const DEPTH = Number(process.env.AGENT_BRIDGE_DEPTH) || 0;
 
 const log = (msg) => process.stderr.write(`[agent-bridge] ${msg}\n`);
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
-const safeForWindowsCmd = (value) => !/[&|<>^%!()"\r\n]/.test(value);
 
 // ---------------------------------------------------------------------------
 // Running the other agent
@@ -395,11 +752,11 @@ function boundedBuffer(limit, headRatio = 0.25) {
 function runAgent(bin, args, prompt, cwd, timeoutMs, { codexJson = false } = {}) {
   return new Promise((resolve) => {
     if (shuttingDown || requestCancelled()) return resolve({ ok: false, text: "Agent call cancelled before starting." });
-    if (IS_WINDOWS && [bin, ...args].some((value) => !safeForWindowsCmd(value))) {
+    const spec = launchSpec(bin, args);
+    if (!spec) {
       return resolve({ ok: false, text: "(refused command containing Windows shell metacharacters)" });
     }
-    const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : bin;
-    const argv = IS_WINDOWS ? ["/d", "/s", "/c", bin, ...args] : args;
+    const { file, argv } = spec;
 
     const child = spawn(file, argv, {
       cwd: cwd || DEFAULT_CWD || process.cwd(),
@@ -479,9 +836,9 @@ function readGit(cwd, args) {
   return new Promise((resolve) => {
     if (shuttingDown || requestCancelled()) return resolve(null);
     const base = cwd || DEFAULT_CWD || process.cwd();
-    const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : "git";
-    const gitArgs = ["-c", "core.fsmonitor=false", ...args];
-    const argv = IS_WINDOWS ? ["/d", "/s", "/c", "git", ...gitArgs] : gitArgs;
+    const spec = launchSpec("git", ["-c", "core.fsmonitor=false", ...args]);
+    if (!spec) return resolve(null);
+    const { file, argv } = spec;
     const child = spawn(file, argv, { cwd: base, stdio: ["ignore", "pipe", "ignore"],
       detached: !IS_WINDOWS, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
     trackChild(child);
@@ -685,7 +1042,7 @@ function codexArgs({ write, prompt, model, effort, resumeId }) {
 
 async function askCodex({ question, cwd, model, effort }) {
   const prompt = askFrame(question);
-  return runAgent(CODEX_BIN, codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS, { codexJson: true });
+  return runAgent(codexBin(), codexArgs({ write: false, prompt, model, effort }), prompt, cwd, ASK_TIMEOUT_MS, { codexJson: true });
 }
 
 async function delegateToCodexUnlocked({ task, files, constraints, acceptance, verify: verifyCommand, cwd, model, effort, allow_writes, lane }) {
@@ -698,7 +1055,7 @@ async function delegateToCodexUnlocked({ task, files, constraints, acceptance, v
   const prompt = delegateFrame({ task, files, constraints, acceptance, verify: verifyCommand, cwd, resuming: Boolean(resumeId) });
   const before = await gitSnapshot(cwd);
   const r = await runAgent(
-    CODEX_BIN,
+    codexBin(),
     codexArgs({ write, prompt, model, effort, resumeId }),
     prompt,
     cwd,
@@ -785,7 +1142,7 @@ async function askClaude({ question, cwd, model, effort }) {
 
   const prompt = askFrame(question);
   const deadline = Date.now() + ASK_TIMEOUT_MS;
-  const first = await runAgent(CLAUDE_BIN, args, prompt, cwd, ASK_TIMEOUT_MS);
+  const first = await runAgent(claudeBin(), args, prompt, cwd, ASK_TIMEOUT_MS);
   if (first.ok) return first;
 
   // Only a pre-execution parser failure may retry. Partial answers, signals,
@@ -808,7 +1165,7 @@ async function askClaude({ question, cwd, model, effort }) {
   const retryArgs = args.filter((a) => a !== flag);
   const remaining = deadline - Date.now();
   if (remaining <= 0 || requestCancelled()) return first;
-  const second = await runAgent(CLAUDE_BIN, retryArgs, prompt, cwd, remaining);
+  const second = await runAgent(claudeBin(), retryArgs, prompt, cwd, remaining);
   // Disclose the consequence where the person affected will actually see it.
   // The README records that dropping this flag may leave the question and
   // answer in local session files, but nobody reads a README at the moment a
@@ -1206,10 +1563,10 @@ function usageFromResult(result, source, asOf) {
 /** Ask the Codex app-server. Short timeout: this is a status line, not the task. */
 function usageFromAppServer() {
   return new Promise((resolve) => {
-    if (IS_WINDOWS && !safeForWindowsCmd(CODEX_BIN)) return resolve(null);
-    const file = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : CODEX_BIN;
-    const args = ["app-server"];
-    const argv = IS_WINDOWS ? ["/d", "/s", "/c", CODEX_BIN, ...args] : args;
+    const known = peekCli("codex");
+    const spec = known && launchSpec(known, ["app-server"]);
+    if (!spec) return resolve(null);
+    const { file, argv } = spec;
     let child;
     try {
       child = spawn(file, argv, { stdio: ["pipe", "pipe", "ignore"], detached: !IS_WINDOWS });
@@ -1850,7 +2207,7 @@ async function handle(msg) {
       const hint = r.ok ? "" : diagnose(r.raw || r.text);
       const advice = r.ok
         ? ""
-        : `\n\n${tool.peer} did not complete${hint ? `: ${hint}` : ""}. ` +
+        : `\n\n${tool.peer} did not complete${hint ? `: ${hint}` : ""}.${notInstalledAdvice(tool.peer)} ` +
           `Carry on without it and tell the user. Do not retry more than once.`;
 
       // The Claude desktop app gives an extension no way to draw UI, so the tool
@@ -2079,6 +2436,39 @@ function startHttp() {
     log(`remote writes: ${REMOTE_WRITES ? "ENABLED" : "disabled (delegations run read-only)"}`);
     log(`browser origins: ${HTTP_ALLOWED_ORIGINS.size ? [...HTTP_ALLOWED_ORIGINS].join(", ") : "none allowed"}`);
   });
+}
+
+/**
+ * `--detect` prints what the bridge found and exits.
+ *
+ * The doctor and the VS Code extension both need to report which CLIs are
+ * installed and where. Reimplementing the search in either one guarantees they
+ * drift from what the server actually launches, and a doctor that disagrees
+ * with the server is worse than no doctor. So detection has exactly one
+ * implementation and the other two spawn it. Stdout is free here because this
+ * mode never speaks MCP.
+ */
+if (DETECT_MODE) {
+  const report = { version: SERVER_VERSION, platform: process.platform, agents: {} };
+  for (const kind of Object.keys(AGENTS)) {
+    const info = resolveCli(kind);
+    const apps = info.apps.length ? info.apps : detectApps(kind);
+    report.agents[kind] = {
+      label: AGENTS[kind].label,
+      command: AGENTS[kind].command,
+      setting: AGENTS[kind].setting,
+      install: AGENTS[kind].install,
+      found: info.found,
+      path: info.found ? info.path : "",
+      source: info.source,
+      version: info.version,
+      searched: info.searched,
+      blocked: info.blocked || [],
+      apps: apps.map((app) => ({ name: app.name, dir: app.dir })),
+    };
+  }
+  process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+  process.exit(0);
 }
 
 // Conserve mode can be flipped from outside while a host is connected, so watch

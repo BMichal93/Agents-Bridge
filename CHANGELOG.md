@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.10
+
+- The `--no-session-persistence` fallback now discloses its privacy consequence
+  in the reply itself, not only in the README. When the flag is dropped, the note
+  states that the question and answer may be written to Claude Code's local
+  session history. A consequence documented only where nobody looks at the moment
+  it occurs is not disclosed.
+
 ## 0.9.9
 
 - Prefer OpenAI Codex for tool-based subagent work in both MCP discovery paths,

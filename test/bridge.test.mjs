@@ -998,6 +998,9 @@ process.stdin.on("end", () => { console.log("answered without the flag"); });
   assert.match(text, /does not accept --no-session-persistence/);
   assert.match(text, /answered without the flag/);
   assert.match(text, /read-only flags were unaffected/);
+  // The privacy consequence must appear in the reply, not only in the README.
+  // Nobody reads documentation at the moment a fallback fires.
+  assert.match(text, /may therefore be written to Claude Code's local session history/);
   c.close();
 });
 

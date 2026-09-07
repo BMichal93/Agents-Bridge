@@ -33,7 +33,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
 
 const IS_WINDOWS = process.platform === "win32";
-const SERVER_VERSION = "0.9.9";
+const SERVER_VERSION = "0.9.10";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -809,7 +809,18 @@ async function askClaude({ question, cwd, model, effort }) {
   const remaining = deadline - Date.now();
   if (remaining <= 0 || requestCancelled()) return first;
   const second = await runAgent(CLAUDE_BIN, retryArgs, prompt, cwd, remaining);
-  const note = `(agent-bridge: this Claude Code does not accept ${flag}; retried without it. The read-only flags were unaffected.)`;
+  // Disclose the consequence where the person affected will actually see it.
+  // The README records that dropping this flag may leave the question and
+  // answer in local session files, but nobody reads a README at the moment a
+  // fallback fires. A privacy consequence disclosed only in documentation is
+  // not disclosed; it belongs in the reply that the fallback produced.
+  const persistenceNote =
+    flag === "--no-session-persistence"
+      ? " This run's question and answer may therefore be written to Claude Code's local session history on this machine."
+      : "";
+  const note =
+    `(agent-bridge: this Claude Code does not accept ${flag}; retried without it. ` +
+    `The read-only flags were unaffected.${persistenceNote})`;
   return { ...second, text: `${note}\n\n${second.text}` };
 }
 

@@ -157,6 +157,15 @@ and it contributes nothing to isolation that `--restricted` and `--bare` do not
 already provide. Put a new flag in the required set only if losing it would
 weaken the contract.
 
+## Disclose consequences in the reply, not the README
+
+When a fallback changes what happens to a person's data, the notice belongs in
+the tool result that the fallback produced. Nobody reads documentation at the
+moment a fallback fires, and the caller relaying the answer cannot pass on a
+caveat it never received. The `--no-session-persistence` retry is the worked
+example: the README records the persistence consequence, and the reply states it
+too.
+
 ## Unverified against a live CLI
 
 The suite substitutes stub executables, so it proves the bridge's behaviour and

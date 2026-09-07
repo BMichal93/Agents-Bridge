@@ -2,6 +2,9 @@
 
 ## 0.9.9
 
+- Prefer OpenAI Codex for tool-based subagent work in both MCP discovery paths,
+  tool descriptions and the installed Claude skill. Preserve explicit provider
+  choices and visible failures; clarify the limits of verification and Git deltas.
 - Retain Claude's optional-versus-required flag split. Recognize quoted parser
   diagnostics on stderr, avoid replaying partial answers, share one timeout.
 - Make the Claude doctor probe call the actual MCP tool (including fallback).

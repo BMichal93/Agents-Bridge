@@ -16,6 +16,12 @@ test/                       node:test suite, drives the real server over stdio
 Start the current return review from `START_HERE_CLAUDE.md` and
 `CODEX_REVIEW_0.9.9.md`. Earlier reviews/responses are preserved as history.
 
+The user's preferred subagent provider is ChatGPT/Codex through Agent Bridge
+tools: `ask_codex` for review, `delegate_to_codex` for one build, or
+`start_codex_jobs` / `collect_codex_jobs` for background work. This uses the local
+Codex CLI. Keep orchestration and acceptance review with the caller; respect
+explicit provider choices and report tool failures without silent fallback.
+
 `src/agent-bridge.mjs` is the only server copy that gets edited. The build copies it into
 each package; those copies are gitignored. If you find yourself editing a file
 under `packages/*/server/`, stop, that change will be overwritten.
@@ -112,7 +118,8 @@ Each test gets its own temporary `HOME`, so nothing reads or writes the real
   through the token would mean this process handling credentials, which is too
   much for a status line.
 - **Retry or fall back to another provider.** A failed peer fails visibly, and
-  after two failures in a session the tool stops calling it.
+  after two failures in a session the tool stops calling it. The single documented
+  optional-flag compatibility retry below is the exception; it keeps the same provider.
 - **Provide a general permissions system.** The bridge applies fixed safety
   boundaries: CLI sandboxes, a verification allowlist and stricter remote-mode
   behavior. It does not implement user identities or per-tool authorization.

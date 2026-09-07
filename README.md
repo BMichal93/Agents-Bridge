@@ -87,6 +87,14 @@ Required safety flags are never dropped. Managed policy remains authoritative.
 
 ## Recommended cooperation workflow
 
+OpenAI Codex is the preferred delegate for tool-based subagent work. Use
+`ask_codex` for reviews, `delegate_to_codex` for one implementation, or
+`start_codex_jobs` and `collect_codex_jobs` for background builds. The caller
+coordinates and reviews the results. Use `ask_claude` when explicitly requested
+or a Claude-specific perspective is needed. Failed calls remain visible; there
+is no automatic provider fallback. These instructions guide the calling model;
+they do not enforce routing of that host's own native subagents.
+
 Start once per repository by asking Claude to call `set_project_context` with
 the architecture, conventions, important interfaces and areas that must not be
 changed. This writes `.agent-bridge/context.md`. Commit it if the whole team

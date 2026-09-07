@@ -90,10 +90,26 @@ function syncSettings() {
  */
 const SKILL = `---
 name: agent-bridge-delegating-to-codex
-description: How to split work with OpenAI Codex - you design, Codex builds. Use whenever the agent-bridge tools (delegate_to_codex, start_codex_jobs) are available and there is implementation work to do, or when the user asks to push work to Codex or save Claude usage.
+description: Delegate reviews and implementation to OpenAI Codex through Agent Bridge tools. Use when those tools are available and a task benefits from a subagent, or the user asks to prioritize ChatGPT/Codex or save Claude usage.
 ---
 
 <!-- managed-by-agent-bridge -->
+
+## Preferred delegate
+
+Use OpenAI Codex through Agent Bridge tools for subagent work by default:
+\`ask_codex\` for read-only analysis or reviews, \`delegate_to_codex\` for one build,
+or \`start_codex_jobs\` followed by \`collect_codex_jobs\` for background builds.
+Prefer these to spawning another Claude worker when the task fits. Respect an
+explicit request for a different provider. Keep coordination and final review
+with the caller.
+
+Here, ChatGPT/Codex means the installed, authenticated OpenAI Codex CLI; this
+bridge cannot connect to an existing ChatGPT conversation. Call the actual
+tools and inspect their results. Describing a delegation is not executing it.
+If a tool is unavailable or fails, report that and choose a next step; do not
+silently switch providers. Use \`ask_claude\` when the user specifically requests
+Claude or a Claude-specific perspective is needed.
 
 ## The split
 
@@ -110,10 +126,9 @@ tests, applying a decided pattern across files, migrations, wiring.
 Default to delegating implementation. When you catch yourself about to write a
 file whose shape you have already decided, that is a handoff you are missing.
 
-## Specify well enough that you do not have to read the result
+## Specify the task and acceptance checks
 
-The saving is not in Codex writing the code. It is in you accepting the work on a
-verdict instead of a diff. So every handoff carries:
+Keep handoffs self-contained and returned evidence concise. Every handoff carries:
 
 - **task** - the goal and the approach you chose, written for someone who has not
   seen this conversation
@@ -143,8 +158,8 @@ made. Different work gets a different lane.
 Use \`start_codex_jobs\` when there is more than one independent piece, or when you
 want to keep designing while building happens. It returns immediately with job
 ids; call \`collect_codex_jobs\` when you reach a point where you need the results.
-Codex is slower than you, which is a reason to run it alongside your work rather
-than in front of it. Tasks with non-overlapping \`files\` run at the same time.
+Tasks with non-overlapping \`files\` run at the same time; keep useful coordination
+work moving while they run.
 
 Use \`delegate_to_codex\` when you need the one thing before you can continue.
 
@@ -158,11 +173,14 @@ Use \`delegate_to_codex\` when you need the one thing before you can continue.
 
 ## After every handoff
 
-Read the verdict first. If verify passed and the working-tree observations look like the change
-you asked for, move on. If there was no verify command, read the diff, and next
-time give one. Verification runs trusted repository code with your user privileges;
-the executable allowlist is not a security sandbox. An empty working-tree report means nothing was written, whatever the summary
-says. Do not loop more than twice on one task; rewrite the spec or do it yourself.
+Read the verdict, assess the acceptance criteria, and review the relevant changes.
+A passing command confirms only what it checks. If there was no verify command,
+the result remains unverified. Verification runs trusted repository code with
+your user privileges; the executable allowlist is not a security sandbox.
+An empty working-tree delta is not proof that nothing was written: clean commits,
+ignored files, or changes outside the repository may be absent. Resolve missing
+evidence before accepting. If the same task repeatedly fails, revise the handoff
+or report the blocker rather than silently switching providers.
 
 ## Tell the user
 

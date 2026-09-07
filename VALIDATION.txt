@@ -1,5 +1,5 @@
 Agent Bridge 0.9.9 — Codex validation record
-Review date: 2026-09-06
+Review dates: 2026-09-06–07
 Input: agent-bridge-0.9.8-codex-review-pack.zip
 Input source head: 6f373b0 (behavioral change 50403aa)
 Environment: Linux, Node v24.19.0, npm 11.9.0
@@ -11,13 +11,13 @@ PASS: npm test on unchanged 0.9.8 — 49 passed, 0 failed.
 
 FINAL GATES
 PASS: npm run check — server, extension and doctor syntax.
-PASS: npm test — 69 passed, 0 failed, 0 skipped; about 25.3 seconds.
+PASS: npm test — 69 passed, 0 failed, 0 skipped; about 23.4 seconds.
       Includes 20 new regression tests in test/review-099.test.mjs.
 PASS: npm run budget — every scenario must now succeed, including real
       node --version verification and stub JSONL lane resume.
-      Tool definitions: 9,573 characters; returned results: 2,248 characters.
-      Combined: 11,821 characters (~2,955 tokens by the script's estimate).
-      Default five-task estimate: ~40,995 caller-context tokens saved, 2.9x.
+      Tool definitions: 9,793 characters; returned results: 2,248 characters.
+      Combined: 12,041 characters (~3,010 tokens by the script's estimate).
+      Default five-task estimate: ~40,940 caller-context tokens saved, 2.9x.
       These are synthetic scenario estimates, NOT total billing or live usage.
 PASS: small-task budget scenario reports a loss; covered by the test suite.
 PASS: npm run doctor -- --no-live — 1 passed, 0 failed, 2 skipped.
@@ -25,13 +25,20 @@ PASS: npm run doctor -- --no-live — 1 passed, 0 failed, 2 skipped.
 PASS: npm run build — both 0.9.9 installers rebuilt successfully.
 PASS: unzip -t on MCPB and VSIX.
 PASS: both embedded server files are byte-identical to src/agent-bridge.mjs.
+PASS: the VSIX extension is byte-identical to packages/vscode/extension.js.
 PASS: MCPB and VSIX package manifests both report 0.9.9.
 PASS: git diff --check.
+PASS: generated Claude delegation skill frontmatter/naming validation.
+PASS: legacy initialize and modern discovery return identical delegation guidance;
+      all five named review/build/collection tools remain discoverable.
+PASS: independent ChatGPT subagent reviewed delegation/handoff instructions;
+      corrected verification/Git overclaims and scoped optional Claude live gates.
+      This reviewer ran through this session's tools, not an authenticated bridge CLI.
 
 SERVER / INSTALLER SHA-256
-b498c7380d1319da4befffa650b7cf37674279690531eee836ec03ca2d6cb69f  src/agent-bridge.mjs
-a191d3fec6880474a4df46cefac0c639dfa706433e2ecae681ff21b4d0dda691  agent-bridge-0.9.9.mcpb
-e6aa67f7e149108c932a3fe7dbe5e3af7321427cc7ea4a2d0077a13dad3e8185  agent-bridge-0.9.9.vsix
+e12577f8a4dec637cfdda5e3a83abba26c358b35f760d89a49479ffa5cc15e5b  src/agent-bridge.mjs
+607ef3bd90b2ff30d2d7e9ad3a61fe317580f40324499846cda38b1d61af7a33  agent-bridge-0.9.9.mcpb
+aee3b262c7f4e4f38d19c0ceeb0a9758713dabfe6e0e6a328d33cb94b480c188  agent-bridge-0.9.9.vsix
 
 EVIDENCE BOUNDARIES
 - No authenticated Codex or Claude model call was executed.

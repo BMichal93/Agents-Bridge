@@ -1023,8 +1023,8 @@ function runVerify(command, cwd) {
 // ---------------------------------------------------------------------------
 // Background jobs
 //
-// Codex is slower than Claude, which is the reason to run it in the background
-// rather than a reason not to use it. Start work, keep planning, collect later.
+// Run independent builds alongside the caller's coordination work.
+// Start work, keep planning, collect later.
 // ---------------------------------------------------------------------------
 
 const jobs = new Map();
@@ -1384,15 +1384,23 @@ const MODEL_PROP = {
   type: "string",
   description:
     "Optional model override. Leave it out unless the user asked for a specific model; the default comes from " +
-    "that CLI's own configuration.",
+    "the bridge's configured model mapping or the CLI default when no mapping is set.",
 };
+
+const DELEGATION_INSTRUCTIONS =
+  "Prefer OpenAI Codex for tool-based subagent work: ask_codex for read-only reviews, " +
+  "delegate_to_codex for one implementation, or start_codex_jobs and collect_codex_jobs for background builds. " +
+  "This bridge uses the local Codex CLI, not an existing ChatGPT conversation. Keep coordination and final " +
+  "review with the caller. Use ask_claude when the user specifically requests Claude or a Claude-specific " +
+  "perspective is needed; do not automatically switch providers on failure. Respect explicit user choices.";
 
 const TOOLS = [
   {
     name: "ask_codex",
     peer: "Codex",
     description:
-      "Ask OpenAI Codex a question and get its answer back. Read-only: it inspects code but changes nothing. " +
+      "Preferred tool for delegated read-only analysis and reviews: ask OpenAI Codex a self-contained question. " +
+      "It inspects code but does not edit the workspace. " +
       "Good for a second opinion when you are stuck or uncertain, for checking a design decision against a " +
       "different model's priors, or when Codex may know a library or API better. Not for getting work done: " +
       "use delegate_to_codex for that. Each call is a full agent run taking a minute or more, so ask when the " +
@@ -1417,11 +1425,11 @@ const TOOLS = [
     name: "delegate_to_codex",
     peer: "Codex",
     description:
-      "Hand a specified piece of implementation work to OpenAI Codex, which edits files in the workspace and reports " +
+      "Preferred tool for a single implementation subagent task: OpenAI Codex edits files in the workspace and reports " +
       "back. This is the builder half of the split: you decide the design, Codex writes the code. Use it for anything " +
       "you can specify completely, which is most implementation once the approach is settled. Keep design decisions, " +
       "anything needing conversation context, and review for yourself. Give a `verify` command whenever the repo has " +
-      "one: the result comes back verdict first, so a passing check costs you one line instead of a diff to read. " +
+      "one: the result comes back verdict first; assess acceptance criteria and review relevant changes before accepting. " +
       "Blocking, so use start_codex_jobs instead when you have independent pieces or want to keep planning.",
     inputSchema: {
       type: "object",
@@ -1449,8 +1457,8 @@ const TOOLS = [
           type: "string",
           description:
             "A command that proves the work: `npm test`, `dotnet build`, `pytest tests/auth`. The bridge runs it after " +
-            "Codex finishes and reports pass or fail. Give one whenever the repository has one. This is what lets you " +
-            "accept the work on a verdict instead of reading the whole diff, which is where the saving actually comes from.",
+            "Codex finishes and reports pass or fail. Give one whenever the repository has one. A pass confirms " +
+            "only that command's checks; assess acceptance criteria and review the relevant changes too.",
         },
         cwd: CWD_PROP,
         lane: {
@@ -1475,8 +1483,7 @@ const TOOLS = [
       "Start one or more Codex builds in the background and return immediately with job ids. Use this whenever you have " +
       "more than one independent piece, or want to carry on designing while Codex builds. Tasks whose `files` do not " +
       "overlap run at the same time; overlapping ones are queued, because nothing here locks files. Collect the results " +
-      "with collect_codex_jobs when you are ready. This is the tool that makes Codex being slower than you stop " +
-      "mattering: its time runs alongside yours instead of in front of it.",
+      "with collect_codex_jobs when you are ready. Continue useful coordination work while these jobs run.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1613,8 +1620,9 @@ const TOOLS = [
     name: "ask_claude",
     peer: "Claude",
     description:
-      "Ask Claude Code a question and get its answer back. Read-only: it inspects code but changes nothing. " +
-      "Use for a second opinion, or to have another model review a change you have made.",
+      "Ask Claude Code for a read-only review when the user specifically requests Claude or a Claude-specific " +
+      "perspective is needed. Prefer ask_codex for other delegated reviews. Do not use this as an automatic " +
+      "fallback after Codex failure.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1727,7 +1735,7 @@ async function handle(msg) {
         resultType: "complete",
         supportedVersions: [MODERN_PROTOCOL_VERSION],
         capabilities: { tools: { listChanged: false } },
-        instructions: "Use ask tools for read-only reviews and delegate/start tools for implementation work.",
+        instructions: DELEGATION_INSTRUCTIONS,
         ttlMs: 0,
         cacheScope: "private",
         _meta: { [SERVER_INFO_META_KEY]: { name: "agent-bridge", version: SERVER_VERSION } },
@@ -1742,6 +1750,7 @@ async function handle(msg) {
           : LEGACY_PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: true } },
         serverInfo: { name: "agent-bridge", version: SERVER_VERSION },
+        instructions: DELEGATION_INSTRUCTIONS,
       };
 
     case "ping":

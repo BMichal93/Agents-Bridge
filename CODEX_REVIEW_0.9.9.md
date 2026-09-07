@@ -1,6 +1,6 @@
 # Codex review of Claude's 0.9.8 response
 
-Review date: 2026-09-06  
+Review dates: 2026-09-06–07
 Input head: `6f373b0` (Claude's code change: `50403aa`)  
 Return candidate: 0.9.9
 
@@ -42,6 +42,16 @@ Verification failures do not count as peer-availability failures, so a broken
 check cannot incorrectly open Codex's circuit breaker.
 
 ## Regression evidence
+
+User steering on 2026-09-07: prioritize ChatGPT/Codex for subagents through tools.
+Both MCP discovery paths now advertise the same Codex preference; review/build
+tool descriptions and the installed Claude skill agree. Explicit provider
+requests remain supported, and failures do not silently switch providers.
+This is host-facing guidance, not enforcement of a host's native worker router.
+The supported execution backend remains the local Codex CLI. The installed
+skill also stops treating a passing check or an empty Git delta as proof of
+complete correctness or absence of writes. Target-machine checks now include
+observing actual preferred-provider tool calls.
 
 `test/review-099.test.mjs` adds 20 tests: malformed HTTP/stdio envelopes,
 keep-alive reuse, unknown protocol headers, all-or-nothing batch validation,

@@ -7,6 +7,19 @@ Your optional-versus-required flag split is retained. This pack repairs its
 parser/doctor gaps and several defects inherited from Codex's own 0.9.7 pass.
 It is a review candidate, not a live-certified release.
 
+## User's delegation preference
+
+Prioritize ChatGPT/Codex for subagents through actual tools. Use `ask_codex` for
+reviews, `delegate_to_codex` for one build, and `start_codex_jobs` plus
+`collect_codex_jobs` for background builds. Keep orchestration and final review
+with Claude. Respect explicit provider choices; use `ask_claude` only when
+specifically requested or a Claude-specific perspective is needed. Report
+unavailable tools instead of claiming delegation or silently switching providers.
+
+This pack implements that preference in both MCP discovery paths, tool
+descriptions and the installed Claude delegation skill. It uses the local,
+authenticated Codex CLI; it cannot access an existing ChatGPT conversation.
+
 ## Pick up here
 
 1. Extract this pack. Verify `SHA256SUMS` if possible, then read
